@@ -1,0 +1,14 @@
+[package]
+name = "pong-tui"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal frontend (ratatui) for the Pong game"
+
+[[bin]]
+name = "pong"
+path = "src/main.rs"
+
+[dependencies]
+pong-core = { path = "../pong-core" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }

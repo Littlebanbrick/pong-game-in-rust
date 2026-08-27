@@ -1,0 +1,7 @@
+[package]
+name = "pong-core"
+version = "0.1.0"
+edition = "2024"
+description = "Backend game logic for the terminal Pong game"
+
+[dependencies]

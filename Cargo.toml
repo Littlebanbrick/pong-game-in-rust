@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/pong-core", "crates/pong-tui"]
+
+# Shared dependency versions for the whole workspace.
+[workspace.dependencies]
+ratatui = "0.30.2"
+crossterm = "0.29.0"
