@@ -5,8 +5,13 @@
 //! communicates with it exclusively through the message protocol described
 //! in ARCHITECTURE.md.
 
+pub mod game;
 pub mod protocol;
 
+pub use game::{
+    BALL_SIZE, BALL_SPEED, DT, Game, PADDLE_HEIGHT, PADDLE_INSET, PADDLE_SPEED, PADDLE_WIDTH,
+    TICKS_PER_SEC, WIN_SCORE,
+};
 pub use protocol::{
     Direction, FIELD_HEIGHT, FIELD_WIDTH, GamePhase, GameSnapshot, InputEvent, Score, Side,
 };
