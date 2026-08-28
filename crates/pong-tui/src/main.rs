@@ -5,6 +5,7 @@
 //! two crates.
 
 mod input;
+mod render;
 mod terminal;
 
 use std::io;
@@ -12,8 +13,6 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event};
 use pong_core::Backend;
-use ratatui::style::Style;
-use ratatui::widgets::Paragraph;
 
 use input::Action;
 
@@ -30,32 +29,34 @@ fn main() -> io::Result<()> {
 }
 
 fn run(guard: &mut terminal::TerminalGuard, backend: &Backend) -> io::Result<()> {
+    // Block for the very first snapshot so the first frame is a real one.
+    let mut snapshot = backend.next_snapshot().map_err(io::Error::other)?;
+
     loop {
-        // Poll keys at ~30 Hz; a timeout keeps the loop responsive even
-        // without input.
-        if event::poll(Duration::from_millis(33))?
-            && let Event::Key(key) = event::read()?
-        {
-            match input::map_key(key) {
-                Action::Send(event) => backend.send(event),
-                Action::Quit => return Ok(()),
-                Action::Ignore => {}
+        // Wait for at most one frame worth of time for the first event,
+        // then drain everything queued behind it.
+        if event::poll(Duration::from_millis(16))? {
+            loop {
+                if let Event::Key(key) = event::read()? {
+                    match input::map_key(key) {
+                        Action::Send(event) => backend.send(event),
+                        Action::Quit => return Ok(()),
+                        Action::Ignore => {}
+                    }
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
 
-        // Drain queued snapshots; real rendering arrives in the next step.
-        let _ = backend.latest_snapshot();
+        // Swap in the freshest state the backend has produced.
+        if let Some(newer) = backend.latest_snapshot() {
+            snapshot = newer;
+        }
 
-        guard.terminal_mut().draw(|frame| {
-            frame.render_widget(
-                Paragraph::new(
-                    "pong — rendering arrives in the next step\n\n\
-                     left paddle: w/s    right paddle: Up/Down\n\n\
-                     press q to quit",
-                )
-                .style(Style::new().cyan()),
-                frame.area(),
-            );
-        })?;
+        guard
+            .terminal_mut()
+            .draw(|frame| render::draw(frame, &snapshot))?;
     }
 }
