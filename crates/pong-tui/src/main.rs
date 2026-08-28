@@ -6,13 +6,14 @@
 
 mod input;
 mod render;
+mod sound;
 mod terminal;
 
-use std::io;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event};
-use pong_core::Backend;
+use pong_core::{Backend, GameEvent};
 
 use input::{Action, InputState};
 
@@ -20,10 +21,17 @@ use input::{Action, InputState};
 const SCORE_FLASH_MS: u128 = 600;
 
 fn main() -> io::Result<()> {
+    // Audio first: a warning about a missing device must land on the
+    // normal screen, before the alternate screen hides it.
+    let sound = sound::SoundPlayer::new();
+    if sound.is_none() {
+        eprintln!("no audio device found: falling back to the terminal bell");
+    }
+
     let mut guard = terminal::TerminalGuard::new()?;
     let backend = Backend::spawn();
 
-    let result = run(&mut guard, &backend);
+    let result = run(&mut guard, &backend, sound.as_ref());
 
     // Restore the shell before anything else, then stop the backend.
     drop(guard);
@@ -31,7 +39,11 @@ fn main() -> io::Result<()> {
     result
 }
 
-fn run(guard: &mut terminal::TerminalGuard, backend: &Backend) -> io::Result<()> {
+fn run(
+    guard: &mut terminal::TerminalGuard,
+    backend: &Backend,
+    sound: Option<&sound::SoundPlayer>,
+) -> io::Result<()> {
     // Block for the very first snapshot so the first frame is a real one.
     let mut snapshot = backend.next_snapshot().map_err(io::Error::other)?;
     let mut input_state = InputState::new();
@@ -70,6 +82,9 @@ fn run(guard: &mut terminal::TerminalGuard, backend: &Backend) -> io::Result<()>
                 score_flash_started = Some(Instant::now());
             }
             last_score_total = total;
+            for event in &newer.events {
+                play_sound(sound, *event);
+            }
             snapshot = newer;
         }
 
@@ -92,5 +107,18 @@ fn apply_action(action: Action, backend: &Backend) -> bool {
             true
         }
         Action::Quit => false,
+    }
+}
+
+/// Plays one game event; without an audio device, falls back to the
+/// terminal bell (one pitch for everything, but better than silence).
+fn play_sound(sound: Option<&sound::SoundPlayer>, event: GameEvent) {
+    match sound {
+        Some(player) => player.play(event),
+        None => {
+            let mut out = io::stdout();
+            let _ = out.write_all(b"\x07");
+            let _ = out.flush();
+        }
     }
 }

@@ -79,6 +79,23 @@ pub struct Score {
     pub right: u32,
 }
 
+/// A discrete thing that happened during a tick, reported to the
+/// frontend for presentation-layer feedback (e.g. sound).
+///
+/// The backend never performs I/O: it only *announces* events in the
+/// snapshot stream; playing them is the frontend's business.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameEvent {
+    /// The ball bounced off a paddle.
+    PaddleHit,
+    /// A point was scored and the round ended (the serving pause
+    /// follows). Not emitted for the match-deciding point — [`GameOver`]
+    /// replaces it so the two tones never sound together.
+    PointScored,
+    /// The match ended: someone reached the winning score.
+    GameOver,
+}
+
 impl Score {
     /// Records one point for `side`.
     pub fn record(&mut self, side: Side) {
@@ -94,7 +111,11 @@ impl Score {
 /// All coordinates are in core field units (see [`FIELD_WIDTH`] and
 /// [`FIELD_HEIGHT`]) and denote the **center** of the object: paddle y is
 /// the center of the paddle, ball x/y the center of the ball.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// `events` lists the [`GameEvent`]s of the tick this snapshot closes;
+/// taking a snapshot consumes them, so each event appears exactly once
+/// in the stream.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GameSnapshot {
     pub phase: GamePhase,
     pub score: Score,
@@ -102,6 +123,7 @@ pub struct GameSnapshot {
     pub right_paddle_y: f32,
     pub ball_x: f32,
     pub ball_y: f32,
+    pub events: Vec<GameEvent>,
 }
 
 /// Width of the play field in core units; x ranges over `0.0 .. FIELD_WIDTH`.

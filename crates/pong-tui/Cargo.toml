@@ -12,3 +12,4 @@ path = "src/main.rs"
 pong-core = { path = "../pong-core" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+rodio = "0.20"

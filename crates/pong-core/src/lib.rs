@@ -15,6 +15,7 @@ pub use game::{
     PADDLE_TAP_SPEED, PADDLE_WIDTH, TICKS_PER_SEC, WIN_SCORE,
 };
 pub use protocol::{
-    Direction, FIELD_HEIGHT, FIELD_WIDTH, GamePhase, GameSnapshot, InputEvent, Score, Side,
+    Direction, FIELD_HEIGHT, FIELD_WIDTH, GameEvent, GamePhase, GameSnapshot, InputEvent, Score,
+    Side,
 };
 pub use runtime::{Backend, BackendClosed};

@@ -66,14 +66,12 @@ impl Backend {
 
     /// Tries to take the newest snapshot without blocking.
     ///
-    /// Discards queued intermediate snapshots and returns the most recent
-    /// one; `None` means nothing is queued yet.
+    /// Discards queued intermediate snapshots but **merges their
+    /// [`GameEvent`]s** into the returned one: events ride per-tick
+    /// snapshots, so dropping intermediates without merging would drop
+    /// the events they carry. `None` means nothing is queued yet.
     pub fn latest_snapshot(&self) -> Option<GameSnapshot> {
-        let mut latest = self.snapshots.try_recv().ok()?;
-        while let Ok(newer) = self.snapshots.try_recv() {
-            latest = newer;
-        }
-        Some(latest)
+        drain_latest(&self.snapshots)
     }
 
     /// Requests shutdown and waits for the thread to finish.
@@ -92,6 +90,19 @@ impl Drop for Backend {
             let _ = handle.join();
         }
     }
+}
+
+/// Drains a snapshot queue, keeping the newest state and concatenating the
+/// events of every drained snapshot onto it.
+fn drain_latest(receiver: &Receiver<GameSnapshot>) -> Option<GameSnapshot> {
+    let mut latest = receiver.try_recv().ok()?;
+    let mut events = std::mem::take(&mut latest.events);
+    while let Ok(mut newer) = receiver.try_recv() {
+        events.append(&mut newer.events);
+        latest = newer;
+    }
+    latest.events = events;
+    Some(latest)
 }
 
 /// Thread body: fixed-rate tick loop with input draining and snapshot
@@ -197,5 +208,43 @@ mod tests {
             );
         }
         backend.join();
+    }
+
+    /// `drain_latest` must not lose events: they ride the intermediate
+    /// snapshots that would otherwise be discarded.
+    #[test]
+    fn drain_latest_merges_events_of_dropped_snapshots() {
+        use crate::protocol::{GameEvent, GamePhase, GameSnapshot};
+
+        fn snap(events: Vec<GameEvent>) -> GameSnapshot {
+            GameSnapshot {
+                phase: GamePhase::Playing,
+                score: Default::default(),
+                left_paddle_y: 30.0,
+                right_paddle_y: 30.0,
+                ball_x: 70.0,
+                ball_y: 30.0,
+                events,
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(snap(vec![GameEvent::PaddleHit])).unwrap();
+        tx.send(snap(vec![])).unwrap();
+        // State of the newest snapshot, but with all three events.
+        tx.send(snap(vec![GameEvent::PaddleHit, GameEvent::PointScored]))
+            .unwrap();
+
+        let merged = drain_latest(&rx).expect("queued snapshots");
+        assert_eq!(
+            merged.events,
+            vec![
+                GameEvent::PaddleHit,
+                GameEvent::PaddleHit,
+                GameEvent::PointScored,
+            ]
+        );
+        // The queue is fully drained afterwards.
+        assert!(drain_latest(&rx).is_none());
     }
 }

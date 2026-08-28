@@ -15,7 +15,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::protocol::{
-    Direction, FIELD_HEIGHT, FIELD_WIDTH, GamePhase, GameSnapshot, InputEvent, Score, Side,
+    Direction, FIELD_HEIGHT, FIELD_WIDTH, GameEvent, GamePhase, GameSnapshot, InputEvent, Score,
+    Side,
 };
 
 /// Simulation rate of the backend, in ticks per second.
@@ -117,6 +118,8 @@ pub struct Game {
     right_speed: f32,
     ball: Ball,
     rng: Xorshift,
+    /// Events of the current tick, handed out by the next `snapshot()`.
+    pending_events: Vec<GameEvent>,
 }
 
 impl Game {
@@ -149,6 +152,7 @@ impl Game {
                 vy: 0.0,
             },
             rng: Xorshift::new(seed),
+            pending_events: Vec::new(),
         };
         // The opening serve goes to a random side.
         let toward = if game.rng.next_bool() {
@@ -221,8 +225,10 @@ impl Game {
         }
     }
 
-    /// Returns a complete renderable copy of the current state.
-    pub fn snapshot(&self) -> GameSnapshot {
+    /// Returns a complete renderable copy of the current state, consuming
+    /// the [`GameEvent`]s of the tick that just ran (each event is
+    /// delivered exactly once across the snapshot stream).
+    pub fn snapshot(&mut self) -> GameSnapshot {
         GameSnapshot {
             phase: self.phase,
             score: self.score,
@@ -230,6 +236,7 @@ impl Game {
             right_paddle_y: self.right_paddle_y,
             ball_x: self.ball.x,
             ball_y: self.ball.y,
+            events: std::mem::take(&mut self.pending_events),
         }
     }
 
@@ -341,6 +348,7 @@ impl Game {
         if !(overlaps_x && overlaps_y) {
             return;
         }
+        self.pending_events.push(GameEvent::PaddleHit);
 
         // Where the ball hit the paddle, from -1 (below the paddle center)
         // to +1 (above it). Steep returns come from the edges, flat ones
@@ -378,8 +386,12 @@ impl Game {
         if let Some(scorer) = scorer {
             self.score.record(scorer);
             if self.score.left >= WIN_SCORE || self.score.right >= WIN_SCORE {
+                // The match-deciding point announces the end of the game
+                // only: PointScored would sound together with it.
+                self.pending_events.push(GameEvent::GameOver);
                 self.phase = GamePhase::GameOver { winner: scorer };
             } else {
+                self.pending_events.push(GameEvent::PointScored);
                 // Serve toward the player who just conceded.
                 self.begin_serve(scorer.opposite());
             }
@@ -860,6 +872,39 @@ mod tests {
         game.tick();
         assert!(game.ball.vx > 0.0);
         assert_eq!(game.ball.x, LEFT_EDGE);
+    }
+
+    /// A paddle bounce announces itself as a PaddleHit event.
+    #[test]
+    fn paddle_bounce_emits_one_paddle_hit_event() {
+        let mut game = game_with_ball(LEFT_EDGE + 0.5, CENTER_Y, -BALL_STEP, BALL_STEP);
+        game.tick();
+        assert_eq!(game.snapshot().events, vec![GameEvent::PaddleHit]);
+        // Consumed by the first snapshot: no double delivery.
+        assert!(game.snapshot().events.is_empty());
+    }
+
+    /// A wall bounce is not a hit: no event for it.
+    #[test]
+    fn wall_bounce_emits_no_event() {
+        let mut game = game_with_ball(FIELD_WIDTH / 2.0, 1.0, 0.0, -BALL_STEP);
+        game.tick();
+        assert!(game.snapshot().events.is_empty());
+    }
+
+    /// A regular point announces PointScored; the match-deciding point
+    /// announces GameOver alone (the tones must not sound together).
+    #[test]
+    fn points_emit_point_scored_and_the_final_point_game_over() {
+        let mut game = game_with_ball(-BALL_HALF - 0.1, CENTER_Y, -BALL_STEP, BALL_STEP);
+        game.tick();
+        assert_eq!(game.snapshot().events, vec![GameEvent::PointScored]);
+
+        let mut game = game_with_ball(FIELD_WIDTH + BALL_HALF + 0.1, CENTER_Y, BALL_STEP, 0.0);
+        game.score.left = WIN_SCORE - 1;
+        game.tick();
+        assert_eq!(game.score.left, WIN_SCORE);
+        assert_eq!(game.snapshot().events, vec![GameEvent::GameOver]);
     }
 
     #[test]
