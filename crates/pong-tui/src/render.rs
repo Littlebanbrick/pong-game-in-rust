@@ -26,16 +26,16 @@ pub struct CourtGeometry {
 }
 
 impl CourtGeometry {
-    /// Chooses the largest court that fits `available` while appearing as
-    /// a ~5:3 horizontal rectangle on screen.
+    /// Chooses the largest court that fits `available` while keeping the
+    /// core field's on-screen proportions (~7:3 horizontal rectangle).
     ///
     /// Character cells are roughly twice as tall as they are wide, so a
-    /// court whose cell ratio `cols/rows` is ~10/3 shows up as ~5:3 — and
-    /// the core's 45° ball trajectories still look like 45°.
+    /// court whose cell ratio `cols/rows` is ~14/3 shows up as ~7:3 — and
+    /// the core's trajectories keep their on-screen angles.
     pub fn fit(available: Rect) -> Self {
-        let rows_by_width = (available.width as u32 * 3 / 10) as u16;
+        let rows_by_width = (available.width as u32 * 3 / 14) as u16;
         let rows = available.height.min(rows_by_width).max(1);
-        let cols = available.width.min((rows as u32 * 10 / 3) as u16).max(1);
+        let cols = available.width.min((rows as u32 * 14 / 3) as u16).max(1);
         let area = Rect {
             x: available.x + (available.width - cols) / 2,
             y: available.y + (available.height - rows) / 2,
@@ -68,7 +68,10 @@ impl CourtGeometry {
 }
 
 /// Draws one frame from a snapshot.
-pub fn draw(frame: &mut Frame<'_>, snapshot: &GameSnapshot) {
+///
+/// `score_flash` styles the score line while the score-flash effect is on
+/// (the frontend blinks it for a short moment after a point).
+pub fn draw(frame: &mut Frame<'_>, snapshot: &GameSnapshot, score_flash: bool) {
     let [score_area, court_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -76,13 +79,30 @@ pub fn draw(frame: &mut Frame<'_>, snapshot: &GameSnapshot) {
     ])
     .areas(frame.area());
 
+    let mut score_line = Line::from(format!(
+        "  {} : {}  ",
+        snapshot.score.left, snapshot.score.right
+    ));
+    if let GamePhase::Serving { toward, ticks_left } = snapshot.phase {
+        let seconds = ticks_left.div_ceil(pong_core::TICKS_PER_SEC as u16);
+        let arrow = match toward {
+            Side::Left => "◀",
+            Side::Right => "▶",
+        };
+        score_line = Line::from(format!(
+            "  {} : {}   ·   serve {} in {}s ",
+            snapshot.score.left, snapshot.score.right, arrow, seconds
+        ));
+    }
+    let score_style = if score_flash {
+        Style::new().yellow().bold()
+    } else {
+        Style::new().bold()
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(format!(
-            "  {} : {}  ",
-            snapshot.score.left, snapshot.score.right
-        )))
-        .alignment(Alignment::Center)
-        .bold(),
+        Paragraph::new(score_line)
+            .alignment(Alignment::Center)
+            .style(score_style),
         score_area,
     );
 
@@ -107,8 +127,10 @@ pub fn draw(frame: &mut Frame<'_>, snapshot: &GameSnapshot) {
     draw_paddle(frame, &geometry, Side::Right, snapshot.right_paddle_y);
 
     let (ball_col, ball_row) = geometry.cell(snapshot.ball_x, snapshot.ball_y);
+    // A filled block, not a circle: round glyphs appear to hop between the
+    // tall terminal cells, a solid square reads as smooth motion.
     frame.buffer_mut()[(ball_col, ball_row)]
-        .set_char('●')
+        .set_char('█')
         .set_style(Style::new().yellow());
 
     if let GamePhase::GameOver { winner } = snapshot.phase {
@@ -209,12 +231,12 @@ mod tests {
 
     #[test]
     fn fit_keeps_the_screen_ratio_for_any_terminal_shape() {
-        // cols/rows must stay ~10/3 so the court looks ~5:3 on screen.
+        // cols/rows must stay ~14/3 so the court looks ~7:3 on screen.
         for (width, height) in [(120u16, 40u16), (80, 30), (200, 20), (40, 10)] {
             let area = CourtGeometry::fit(rect(width, height)).area();
             let ratio = area.width as f32 / area.height as f32;
             assert!(
-                (ratio - 10.0 / 3.0).abs() < 0.35,
+                (ratio - 14.0 / 3.0).abs() < 0.5,
                 "ratio {ratio} for terminal {width}x{height}"
             );
         }
@@ -222,9 +244,9 @@ mod tests {
 
     #[test]
     fn fit_centers_the_court_in_extra_space() {
-        let area = CourtGeometry::fit(rect(160, 30)).area();
-        // rows: 30 (height-limited), cols: 100 → 30 cells of margin each side.
-        assert_eq!(area.width, 100);
+        let area = CourtGeometry::fit(rect(200, 30)).area();
+        // rows: 30 (height-limited), cols: 140 → 30 cells of margin each side.
+        assert_eq!(area.width, 140);
         assert_eq!(area.x, 30);
         assert_eq!(area.y, 0);
     }
@@ -238,12 +260,12 @@ mod tests {
 
     #[test]
     fn cell_maps_center_and_clamps_corners() {
-        let geometry = CourtGeometry::fit(rect(80, 24));
+        let geometry = CourtGeometry::fit(rect(112, 24));
         assert_eq!(geometry.cell(0.0, 0.0), (0, 0));
         assert_eq!(
             geometry.cell(FIELD_WIDTH / 2.0, FIELD_HEIGHT / 2.0),
-            (40, 12)
+            (56, 12)
         );
-        assert_eq!(geometry.cell(FIELD_WIDTH, FIELD_HEIGHT), (79, 23));
+        assert_eq!(geometry.cell(FIELD_WIDTH, FIELD_HEIGHT), (111, 23));
     }
 }

@@ -133,11 +133,17 @@ mod tests {
     #[test]
     fn snapshots_stream_at_least_once_per_tick() {
         let backend = Backend::spawn();
+        // A fresh game starts in the serving pause; the countdown must
+        // advance between two consecutive snapshots.
         let first = backend.next_snapshot().expect("first snapshot");
-        assert_eq!(first.phase, GamePhase::Playing);
-        // Ball must be moving: two ticks must differ in position.
         let second = backend.next_snapshot().expect("second snapshot");
-        assert_ne!(first.ball_x, second.ball_x);
+        match (first.phase, second.phase) {
+            (
+                GamePhase::Serving { ticks_left: a, .. },
+                GamePhase::Serving { ticks_left: b, .. },
+            ) => assert_eq!(a, b + 1),
+            (a, b) => panic!("expected serving phases, got {a:?} -> {b:?}"),
+        }
         backend.join();
     }
 
@@ -150,6 +156,7 @@ mod tests {
             backend.send(InputEvent::SetPaddleDirection {
                 side: Side::Left,
                 direction: Some(Direction::Up),
+                held: true,
             });
             let after = backend.next_snapshot().expect("snapshot");
             if after.left_paddle_y < before.left_paddle_y {
@@ -180,7 +187,14 @@ mod tests {
         // After draining, the queue is empty (beyond at most one new tick).
         let drained = backend.latest_snapshot();
         if let Some(newer) = drained {
-            assert!(newer.ball_x != latest.ball_x || newer.ball_y != latest.ball_y);
+            // Adjacent ticks always differ somehow: during the serving
+            // pause the ball is parked at the center while `ticks_left`
+            // (inside the phase) advances; once playing, the ball moves.
+            assert!(
+                newer.phase != latest.phase
+                    || newer.ball_x != latest.ball_x
+                    || newer.ball_y != latest.ball_y
+            );
         }
         backend.join();
     }

@@ -1,8 +1,9 @@
 //! Terminal lifecycle: enter raw mode + the alternate screen, restore on exit.
 //!
-//! A panic hook guarantees the terminal is restored even if the frontend
-//! panics while in raw mode — otherwise a crashed app would leave the
-//! user's shell unusable.
+//! No keyboard protocol is negotiated here: the input model in
+//! [`crate::input`] works on plain key events. A panic hook guarantees
+//! the terminal is restored even if the frontend panics while in raw
+//! mode — otherwise a crashed app would leave the user's shell unusable.
 
 use std::io::{self, Stdout};
 

@@ -76,6 +76,7 @@ fn main() -> io::Result<()> {
         game.handle_input(InputEvent::SetPaddleDirection {
             side: Side::Right,
             direction: chase,
+            held: true,
         });
 
         game.tick();
@@ -97,13 +98,16 @@ fn handle_key(game: &mut Game, quit: &mut bool, key: event::KeyEvent) {
         return;
     }
     match key.code {
+        // The harness keeps inputs simple: full speed, no repeat modeling.
         KeyCode::Char('w') => game.handle_input(InputEvent::SetPaddleDirection {
             side: Side::Left,
             direction: Some(Direction::Up),
+            held: true,
         }),
         KeyCode::Char('s') => game.handle_input(InputEvent::SetPaddleDirection {
             side: Side::Left,
             direction: Some(Direction::Down),
+            held: true,
         }),
         KeyCode::Char('r') => game.handle_input(InputEvent::Restart),
         KeyCode::Char('q') | KeyCode::Esc => *quit = true,
@@ -148,7 +152,7 @@ fn render(snapshot: &pong_core::GameSnapshot) -> io::Result<()> {
         && ball_row >= 0
         && ball_row < VIEW_ROWS as isize
     {
-        buf[ball_row as usize][ball_col as usize] = '◉';
+        buf[ball_row as usize][ball_col as usize] = '█';
     }
 
     let mut out = String::new();

@@ -5,11 +5,12 @@
 //! its state with [`Game::snapshot`]. It performs no I/O and measures time
 //! only in ticks, which keeps the simulation deterministic and testable.
 //!
-//! Phase-1 physics is deliberately minimal: the ball always travels along a
-//! 45° diagonal (both velocity components have equal magnitude) and every
-//! bounce simply flips one component's sign. Position changes by hits on the
-//! paddle, hit-offset-dependent angles, and acceleration are left for later
-//! phases.
+//! Phase-2 physics: the ball always travels at exactly [`BALL_SPEED`] (only
+//! its direction changes) and the bounce angle off a paddle depends on where
+//! the ball hits it — the paddle edge returns steep angles, the center
+//! returns a flat one. Between points the game pauses in
+//! [`GamePhase::Serving`] before serving toward the player who just
+//! conceded.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,19 +37,39 @@ pub const PADDLE_INSET: f32 = 5.0;
 /// Ball diameter in field units.
 pub const BALL_SIZE: f32 = 1.0;
 
-/// Paddle speed in field units per second.
-pub const PADDLE_SPEED: f32 = 50.0;
+/// Paddle speed in field units per second while the player's key is
+/// confirmed held (its auto-repeat stream has arrived).
+pub const PADDLE_SPEED: f32 = 60.0;
 
-/// Ball speed (path length) in field units per second.
+/// Paddle speed before the hold is confirmed — a bare tap. Half of the
+/// full speed, so the unavoidable tap-detection window moves the paddle
+/// at most ~0.3 of the field height while staying responsive.
+pub const PADDLE_TAP_SPEED: f32 = PADDLE_SPEED / 2.0;
+
+/// Paddle acceleration while ramping from tap to full speed after the
+/// hold is confirmed, in field units per second squared. Chosen so the
+/// ramp takes ~250 ms.
+pub const PADDLE_ACCEL: f32 = (PADDLE_SPEED - PADDLE_TAP_SPEED) / 0.25;
+
+/// Ball speed (path length) in field units per second. The resultant speed
+/// magnitude never changes; only its direction does.
 pub const BALL_SPEED: f32 = 80.0;
+
+/// Pause between a point and the next serve, in ticks.
+pub const SERVE_PAUSE_TICKS: u16 = TICKS_PER_SEC as u16;
+
+/// Steepest bounce angle off a paddle (hit at the paddle edge), in radians.
+pub const MAX_BOUNCE_ANGLE: f32 = std::f32::consts::PI / 3.0;
+
+/// Angle (from horizontal) at which serves leave the center, in radians.
+const SERVE_ANGLE: f32 = std::f32::consts::PI / 6.0;
 
 const PADDLE_HALF_W: f32 = PADDLE_WIDTH / 2.0;
 const PADDLE_HALF_H: f32 = PADDLE_HEIGHT / 2.0;
 const BALL_HALF: f32 = BALL_SIZE / 2.0;
 
-/// Absolute value of each ball velocity component, per tick. The ball always
-/// moves at exactly 45°, so this is the per-tick displacement on both axes.
-const BALL_STEP: f32 = BALL_SPEED * std::f32::consts::FRAC_1_SQRT_2 * DT;
+/// Ball displacement per tick at [`BALL_SPEED`].
+const BALL_STEP: f32 = BALL_SPEED * DT;
 
 /// Ball position and velocity (center coordinates, field units).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -57,6 +78,13 @@ struct Ball {
     y: f32,
     vx: f32,
     vy: f32,
+}
+
+impl Ball {
+    /// Resultant speed magnitude per tick.
+    fn speed(&self) -> f32 {
+        (self.vx * self.vx + self.vy * self.vy).sqrt()
+    }
 }
 
 /// Full game state. See the [module docs](self) for the intended usage.
@@ -68,12 +96,16 @@ pub struct Game {
     right_paddle_y: f32,
     left_direction: Option<Direction>,
     right_direction: Option<Direction>,
+    left_held: bool,
+    right_held: bool,
+    left_speed: f32,
+    right_speed: f32,
     ball: Ball,
     rng: Xorshift,
 }
 
 impl Game {
-    /// Creates a game in the initial state with a randomly directed serve.
+    /// Creates a game paused before the first serve (random direction).
     pub fn new() -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -91,6 +123,10 @@ impl Game {
             right_paddle_y: FIELD_HEIGHT / 2.0,
             left_direction: None,
             right_direction: None,
+            left_held: false,
+            right_held: false,
+            left_speed: 0.0,
+            right_speed: 0.0,
             ball: Ball {
                 x: 0.0,
                 y: 0.0,
@@ -99,19 +135,35 @@ impl Game {
             },
             rng: Xorshift::new(seed),
         };
-        game.serve();
+        // The opening serve goes to a random side.
+        let toward = if game.rng.next_bool() {
+            Side::Left
+        } else {
+            Side::Right
+        };
+        game.begin_serve(toward);
         game
     }
 
     /// Applies one input event from the frontend.
     pub fn handle_input(&mut self, event: InputEvent) {
         match event {
-            InputEvent::SetPaddleDirection { side, direction } => match side {
-                Side::Left => self.left_direction = direction,
-                Side::Right => self.right_direction = direction,
+            InputEvent::SetPaddleDirection {
+                side,
+                direction,
+                held,
+            } => match side {
+                Side::Left => {
+                    self.left_direction = direction;
+                    self.left_held = held;
+                }
+                Side::Right => {
+                    self.right_direction = direction;
+                    self.right_held = held;
+                }
             },
             InputEvent::Restart => {
-                if self.phase != GamePhase::Playing {
+                if matches!(self.phase, GamePhase::GameOver { .. }) {
                     self.reset();
                 }
             }
@@ -122,20 +174,36 @@ impl Game {
 
     /// Advances the simulation by one tick.
     ///
-    /// While the match is over, the whole simulation freezes until a
-    /// [`InputEvent::Restart`] arrives.
+    /// * [`GamePhase::Serving`] — paddles keep moving, the ball waits at
+    ///   the center until the countdown runs out.
+    /// * [`GamePhase::Playing`] — full simulation.
+    /// * [`GamePhase::GameOver`] — everything freezes until a restart.
     pub fn tick(&mut self) {
-        if self.phase != GamePhase::Playing {
-            return;
+        match self.phase {
+            GamePhase::Serving { toward, ticks_left } => {
+                self.move_paddle(Side::Left);
+                self.move_paddle(Side::Right);
+                if ticks_left <= 1 {
+                    self.launch_serve(toward);
+                } else {
+                    self.phase = GamePhase::Serving {
+                        toward,
+                        ticks_left: ticks_left - 1,
+                    };
+                }
+            }
+            GamePhase::Playing => {
+                self.move_paddle(Side::Left);
+                self.move_paddle(Side::Right);
+                self.ball.x += self.ball.vx;
+                self.ball.y += self.ball.vy;
+                self.bounce_off_walls();
+                self.bounce_off_paddle(Side::Left);
+                self.bounce_off_paddle(Side::Right);
+                self.score_if_ball_exited();
+            }
+            GamePhase::GameOver { .. } => {}
         }
-        self.move_paddle(Side::Left);
-        self.move_paddle(Side::Right);
-        self.ball.x += self.ball.vx;
-        self.ball.y += self.ball.vy;
-        self.bounce_off_walls();
-        self.bounce_off_paddle(Side::Left);
-        self.bounce_off_paddle(Side::Right);
-        self.score_if_ball_exited();
     }
 
     /// Returns a complete renderable copy of the current state.
@@ -150,44 +218,82 @@ impl Game {
         }
     }
 
-    /// Resets to a fresh match and serves.
+    /// Resets to a fresh match with an opening serve toward a random side.
     fn reset(&mut self) {
-        self.phase = GamePhase::Playing;
         self.score = Score::default();
         self.left_paddle_y = FIELD_HEIGHT / 2.0;
         self.right_paddle_y = FIELD_HEIGHT / 2.0;
         self.left_direction = None;
         self.right_direction = None;
-        self.serve();
+        self.left_held = false;
+        self.right_held = false;
+        self.left_speed = 0.0;
+        self.right_speed = 0.0;
+        let toward = if self.rng.next_bool() {
+            Side::Left
+        } else {
+            Side::Right
+        };
+        self.begin_serve(toward);
     }
 
-    /// Places the ball at the center with a random 45° direction.
-    fn serve(&mut self) {
+    /// Enters the serving pause: ball parked at the center, velocity zero.
+    fn begin_serve(&mut self, toward: Side) {
+        self.phase = GamePhase::Serving {
+            toward,
+            ticks_left: SERVE_PAUSE_TICKS,
+        };
         self.ball = Ball {
             x: FIELD_WIDTH / 2.0,
             y: FIELD_HEIGHT / 2.0,
-            vx: if self.rng.next_bool() {
-                BALL_STEP
-            } else {
-                -BALL_STEP
-            },
-            vy: if self.rng.next_bool() {
-                BALL_STEP
-            } else {
-                -BALL_STEP
-            },
+            vx: 0.0,
+            vy: 0.0,
         };
     }
 
-    fn move_paddle(&mut self, side: Side) {
-        let (y, direction) = match side {
-            Side::Left => (&mut self.left_paddle_y, self.left_direction),
-            Side::Right => (&mut self.right_paddle_y, self.right_direction),
+    /// Launches the ball toward `toward` at [`SERVE_ANGLE`] with a random
+    /// vertical sign, keeping the speed magnitude at [`BALL_SPEED`].
+    fn launch_serve(&mut self, toward: Side) {
+        let vx = match toward {
+            Side::Left => -BALL_STEP * SERVE_ANGLE.cos(),
+            Side::Right => BALL_STEP * SERVE_ANGLE.cos(),
         };
+        let vy = BALL_STEP * SERVE_ANGLE.sin();
+        let vy = if self.rng.next_bool() { vy } else { -vy };
+        self.ball.vx = vx;
+        self.ball.vy = vy;
+        self.phase = GamePhase::Playing;
+    }
+
+    fn move_paddle(&mut self, side: Side) {
+        let (y, direction, held, speed) = match side {
+            Side::Left => (
+                &mut self.left_paddle_y,
+                self.left_direction,
+                self.left_held,
+                &mut self.left_speed,
+            ),
+            Side::Right => (
+                &mut self.right_paddle_y,
+                self.right_direction,
+                self.right_held,
+                &mut self.right_speed,
+            ),
+        };
+        // Speed model: an unconfirmed tap moves at a constant crawl; a
+        // confirmed hold ramps linearly up to the full speed; releasing
+        // stops instantly. Pressing from standstill starts at the crawl
+        // speed — first-tick responsiveness is the whole point of the
+        // tap tier, so only the tap→full transition is smoothed.
+        *speed = match direction {
+            None => 0.0,
+            Some(_) if !held => PADDLE_TAP_SPEED,
+            Some(_) => (*speed + PADDLE_ACCEL * DT).clamp(PADDLE_TAP_SPEED, PADDLE_SPEED),
+        };
+        let Some(direction) = direction else { return };
         let step = match direction {
-            Some(Direction::Up) => -PADDLE_SPEED * DT,
-            Some(Direction::Down) => PADDLE_SPEED * DT,
-            None => return,
+            Direction::Up => -*speed * DT,
+            Direction::Down => *speed * DT,
         };
         *y = (*y + step).clamp(PADDLE_HALF_H, FIELD_HEIGHT - PADDLE_HALF_H);
     }
@@ -221,9 +327,26 @@ impl Game {
         if !(overlaps_x && overlaps_y) {
             return;
         }
-        // Send the ball back the way it came and push it out of the paddle,
-        // so the overlap test cannot fire again on the next tick.
-        self.ball.vx = -self.ball.vx;
+
+        // Where the ball hit the paddle, from -1 (below the paddle center)
+        // to +1 (above it). Steep returns come from the edges, flat ones
+        // from the center. Only the direction changes; the resultant speed
+        // magnitude is kept at BALL_SPEED.
+        let offset = ((self.ball.y - paddle_y) / PADDLE_HALF_H).clamp(-1.0, 1.0);
+        let angle = offset * MAX_BOUNCE_ANGLE;
+        let (dir_x, dir_y) = match side {
+            Side::Left => (1.0, 1.0),
+            Side::Right => (-1.0, 1.0),
+        };
+        self.ball.vx = dir_x * BALL_STEP * angle.cos();
+        self.ball.vy = dir_y * BALL_STEP * angle.sin();
+
+        // The invariant the whole physics rests on: bounces change only
+        // the direction, never the speed magnitude.
+        debug_assert!((self.ball.speed() - BALL_STEP).abs() < 1e-5);
+
+        // Push the ball out of the paddle so the overlap test cannot fire
+        // again on the next tick.
         self.ball.x = match side {
             Side::Left => paddle_x + PADDLE_HALF_W + BALL_HALF,
             Side::Right => paddle_x - PADDLE_HALF_W - BALL_HALF,
@@ -243,7 +366,8 @@ impl Game {
             if self.score.left >= WIN_SCORE || self.score.right >= WIN_SCORE {
                 self.phase = GamePhase::GameOver { winner: scorer };
             } else {
-                self.serve();
+                // Serve toward the player who just conceded.
+                self.begin_serve(scorer.opposite());
             }
         }
     }
@@ -290,11 +414,222 @@ mod tests {
     const LEFT_EDGE: f32 = LEFT_PADDLE_X + PADDLE_HALF_W + BALL_HALF;
     const RIGHT_EDGE: f32 = RIGHT_PADDLE_X - PADDLE_HALF_W - BALL_HALF;
 
-    /// A game whose ball is replaced with a deterministic one.
+    /// A playing game whose ball is replaced with a deterministic one.
     fn game_with_ball(x: f32, y: f32, vx: f32, vy: f32) -> Game {
         let mut game = Game::initial(42);
+        game.phase = GamePhase::Playing;
         game.ball = Ball { x, y, vx, vy };
         game
+    }
+
+    /// A playing game with the left paddle at a chosen height.
+    fn game_with_left_paddle(y: f32) -> Game {
+        let mut game = Game::initial(42);
+        game.phase = GamePhase::Playing;
+        game.left_paddle_y = y;
+        game
+    }
+
+    /// Advances the game past the serving pause, into play.
+    fn play_after_serve(game: &mut Game) {
+        while matches!(game.phase, GamePhase::Serving { .. }) {
+            game.tick();
+        }
+    }
+
+    /// Steers one paddle; `held` reports a confirmed key hold.
+    fn steer(game: &mut Game, side: Side, direction: Option<Direction>, held: bool) {
+        game.handle_input(InputEvent::SetPaddleDirection {
+            side,
+            direction,
+            held,
+        });
+    }
+
+    #[test]
+    fn unconfirmed_tap_moves_at_tap_speed() {
+        let mut game = Game::initial(42);
+        steer(&mut game, Side::Left, Some(Direction::Up), false);
+        let before = game.left_paddle_y;
+        game.tick();
+        let expected = before - PADDLE_TAP_SPEED * DT;
+        assert!((game.left_paddle_y - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn held_flag_without_direction_moves_nothing() {
+        let mut game = Game::initial(42);
+        steer(&mut game, Side::Left, None, true);
+        let before = game.left_paddle_y;
+        game.tick();
+        assert_eq!(game.left_paddle_y, before);
+    }
+
+    #[test]
+    fn confirming_the_same_direction_speeds_the_paddle_up() {
+        let mut game = Game::initial(42);
+        steer(&mut game, Side::Left, Some(Direction::Up), false);
+        let start = game.left_paddle_y;
+        game.tick();
+        let tap_step = start - game.left_paddle_y; // upward: positive
+        steer(&mut game, Side::Left, Some(Direction::Up), true);
+        game.tick();
+        let ramp_step = (start - game.left_paddle_y) - tap_step;
+        assert!(
+            ramp_step > tap_step,
+            "ramp step {ramp_step} should exceed tap step {tap_step}"
+        );
+    }
+
+    /// The confirmation ramp: starts at the tap speed, accelerates
+    /// monotonically, and settles at exactly the full speed.
+    #[test]
+    fn confirmed_hold_ramps_to_full_speed() {
+        let mut game = Game::initial(42);
+        steer(&mut game, Side::Left, Some(Direction::Up), true);
+        let start = game.left_paddle_y;
+        game.tick();
+        let first_step = start - game.left_paddle_y;
+        assert!(
+            (first_step - PADDLE_TAP_SPEED * DT).abs() < 1e-6,
+            "ramp starts at the tap speed"
+        );
+        // ~20 ticks: ramp completes long before the wall is near.
+        let mut last_step = first_step;
+        for _ in 0..20 {
+            let before = game.left_paddle_y;
+            game.tick();
+            let step = before - game.left_paddle_y;
+            assert!(
+                step >= last_step - 1e-6,
+                "speed must not decrease while held"
+            );
+            last_step = step;
+        }
+        assert!(
+            (last_step - PADDLE_SPEED * DT).abs() < 1e-6,
+            "reaches the full speed"
+        );
+    }
+
+    /// Reversing direction mid-ramp keeps the current speed: reversing
+    /// is instant, no re-acceleration from the tap speed.
+    #[test]
+    fn reversing_direction_keeps_the_current_speed() {
+        let mut game = Game::initial(42);
+        steer(&mut game, Side::Left, Some(Direction::Down), true);
+        for _ in 0..20 {
+            game.tick();
+        }
+        let before = game.left_paddle_y;
+        steer(&mut game, Side::Left, Some(Direction::Up), true);
+        game.tick();
+        let step = game.left_paddle_y - before; // upward: negative
+        assert!(
+            (step + PADDLE_SPEED * DT).abs() < 1e-6,
+            "reversal at full speed stays at full speed"
+        );
+    }
+
+    /// After a stop, a new unconfirmed press snaps back to the tap
+    /// speed — leftover ramp momentum must not leak into fresh taps.
+    #[test]
+    fn speed_snaps_back_to_tap_after_a_stop() {
+        let mut game = Game::initial(42);
+        steer(&mut game, Side::Left, Some(Direction::Down), true);
+        for _ in 0..20 {
+            game.tick();
+        }
+        steer(&mut game, Side::Left, None, false);
+        game.tick(); // comes to rest
+        steer(&mut game, Side::Left, Some(Direction::Down), false);
+        let before = game.left_paddle_y;
+        game.tick();
+        let expected = before + PADDLE_TAP_SPEED * DT;
+        assert!((game.left_paddle_y - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn new_game_starts_in_serving_pause() {
+        let game = Game::initial(42);
+        assert!(matches!(game.phase, GamePhase::Serving { .. }));
+        assert_eq!(game.ball.x, FIELD_WIDTH / 2.0);
+        assert_eq!(game.ball.y, FIELD_HEIGHT / 2.0);
+        assert_eq!(game.ball.speed(), 0.0);
+    }
+
+    #[test]
+    fn serve_launches_after_the_pause_with_constant_speed() {
+        for seed in 0..64 {
+            let mut game = Game::initial(seed);
+            let GamePhase::Serving { toward, .. } = game.phase else {
+                panic!("expected serving phase");
+            };
+            play_after_serve(&mut game);
+            assert_eq!(game.phase, GamePhase::Playing);
+            // Moving toward the announced side.
+            let vx_sign = match toward {
+                Side::Left => -1.0,
+                Side::Right => 1.0,
+            };
+            assert_eq!(game.ball.vx.signum(), vx_sign);
+            // Speed magnitude is BALL_SPEED, serve angle is SERVE_ANGLE.
+            assert!((game.ball.speed() - BALL_STEP).abs() < 1e-6);
+            let angle = (game.ball.vy / game.ball.vx.abs()).atan();
+            assert!((angle.abs() - SERVE_ANGLE).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn serve_after_a_point_goes_to_the_loser() {
+        let mut game = game_with_ball(-BALL_HALF - 0.1, CENTER_Y, -BALL_STEP, 0.5);
+        game.tick();
+        assert_eq!(game.score.right, 1);
+        // Ball exited past the LEFT wall: left conceded, next serve goes left.
+        assert_eq!(
+            game.phase,
+            GamePhase::Serving {
+                toward: Side::Left,
+                ticks_left: SERVE_PAUSE_TICKS
+            }
+        );
+        play_after_serve(&mut game);
+        assert!(game.ball.vx < 0.0, "ball should fly toward the left player");
+    }
+
+    #[test]
+    fn paddles_move_while_serving() {
+        let mut game = Game::initial(42);
+        game.handle_input(InputEvent::SetPaddleDirection {
+            side: Side::Left,
+            direction: Some(Direction::Up),
+            held: true,
+        });
+        let before = game.left_paddle_y;
+        game.tick();
+        // First tick after the press runs at the tap speed even when the
+        // hold is already confirmed: the ramp starts there.
+        let expected = before - PADDLE_TAP_SPEED * DT;
+        assert!((game.left_paddle_y - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn serving_countdown_decrements_per_tick() {
+        let mut game = Game::initial(42);
+        let GamePhase::Serving {
+            ticks_left: first, ..
+        } = game.phase
+        else {
+            panic!("expected serving phase");
+        };
+        game.tick();
+        let GamePhase::Serving {
+            ticks_left: second, ..
+        } = game.phase
+        else {
+            panic!("expected serving phase");
+        };
+        assert_eq!(first - 1, second);
     }
 
     #[test]
@@ -311,10 +646,12 @@ mod tests {
         game.handle_input(InputEvent::SetPaddleDirection {
             side: Side::Left,
             direction: Some(Direction::Up),
+            held: true,
         });
         let before = game.left_paddle_y;
         game.tick();
-        let expected = before - PADDLE_SPEED * DT;
+        // Ramping starts at the tap speed (see the speed model).
+        let expected = before - PADDLE_TAP_SPEED * DT;
         assert!((game.left_paddle_y - expected).abs() < 1e-6);
     }
 
@@ -324,11 +661,13 @@ mod tests {
         game.handle_input(InputEvent::SetPaddleDirection {
             side: Side::Right,
             direction: Some(Direction::Down),
+            held: true,
         });
         game.tick();
         game.handle_input(InputEvent::SetPaddleDirection {
             side: Side::Right,
             direction: None,
+            held: true,
         });
         let before = game.right_paddle_y;
         game.tick();
@@ -341,6 +680,7 @@ mod tests {
         game.handle_input(InputEvent::SetPaddleDirection {
             side: Side::Left,
             direction: Some(Direction::Up),
+            held: true,
         });
         for _ in 0..TICKS_PER_SEC {
             game.tick();
@@ -350,6 +690,7 @@ mod tests {
         game.handle_input(InputEvent::SetPaddleDirection {
             side: Side::Left,
             direction: Some(Direction::Down),
+            held: true,
         });
         for _ in 0..2 * TICKS_PER_SEC {
             game.tick();
@@ -379,6 +720,74 @@ mod tests {
     }
 
     #[test]
+    fn wall_bounce_keeps_the_speed_magnitude() {
+        // Constructed so that the resultant per-tick speed is BALL_STEP.
+        let mut game = game_with_ball(
+            FIELD_WIDTH / 2.0,
+            BALL_HALF + 0.1,
+            0.8 * BALL_STEP,
+            -0.6 * BALL_STEP,
+        );
+        game.tick();
+        assert!((game.ball.speed() - BALL_STEP).abs() < 1e-6);
+    }
+
+    #[test]
+    fn center_hit_returns_flat() {
+        // Ball meets the paddle dead center: flat return (no vertical part).
+        let mut game = game_with_left_paddle(CENTER_Y);
+        game.ball = Ball {
+            x: LEFT_EDGE + 0.5,
+            y: CENTER_Y,
+            vx: -BALL_STEP,
+            vy: 0.0,
+        };
+        game.tick();
+        assert_eq!(game.ball.vy, 0.0);
+        assert!((game.ball.vx - BALL_STEP).abs() < 1e-6);
+        assert_eq!(game.ball.x, LEFT_EDGE);
+    }
+
+    #[test]
+    fn edge_hit_returns_steepest_angle() {
+        // Ball meets the top edge of the paddle: steepest return upward.
+        let mut game = game_with_left_paddle(CENTER_Y);
+        let hit_y = CENTER_Y - PADDLE_HALF_H + 0.1;
+        game.ball = Ball {
+            x: LEFT_EDGE + 0.5,
+            y: hit_y,
+            vx: -BALL_STEP,
+            vy: 0.0,
+        };
+        game.tick();
+        assert!(game.ball.vy < 0.0, "edge hit should return upward");
+        let angle = (game.ball.vy / game.ball.vx).abs().atan();
+        assert!((angle - MAX_BOUNCE_ANGLE).abs() < 0.05, "angle {angle}");
+        assert!((game.ball.speed() - BALL_STEP).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bounce_keeps_the_speed_magnitude_for_all_hit_positions() {
+        for step in 0..=10 {
+            let offset = -1.0 + 2.0 * step as f32 / 10.0;
+            let paddle_y = CENTER_Y;
+            let hit_y = paddle_y + offset * (PADDLE_HALF_H - BALL_HALF);
+            let mut game = game_with_left_paddle(paddle_y);
+            game.ball = Ball {
+                x: LEFT_EDGE + 0.5,
+                y: hit_y,
+                vx: -BALL_STEP,
+                vy: 0.0,
+            };
+            game.tick();
+            assert!(
+                (game.ball.speed() - BALL_STEP).abs() < 1e-6,
+                "speed changed at offset {offset}"
+            );
+        }
+    }
+
+    #[test]
     fn ball_bounces_off_left_paddle() {
         let mut game = game_with_ball(LEFT_EDGE + 0.5, CENTER_Y, -BALL_STEP, BALL_STEP);
         game.tick();
@@ -395,7 +804,7 @@ mod tests {
     }
 
     #[test]
-    fn missed_ball_scores_and_reserves_at_center() {
+    fn missed_ball_scores_and_parks_at_center() {
         let mut game = game_with_ball(-BALL_HALF - 0.1, CENTER_Y, -BALL_STEP, BALL_STEP);
         game.tick();
         assert_eq!(game.score.right, 1);
@@ -431,7 +840,7 @@ mod tests {
         assert_ne!(game.phase, GamePhase::Playing); // setup guard
 
         game.handle_input(InputEvent::Restart);
-        assert_eq!(game.phase, GamePhase::Playing);
+        assert!(matches!(game.phase, GamePhase::Serving { .. }));
         assert_eq!(game.score, Score::default());
         assert_eq!(game.left_paddle_y, CENTER_Y);
         assert_eq!(game.right_paddle_y, CENTER_Y);
@@ -440,6 +849,7 @@ mod tests {
     #[test]
     fn restart_is_ignored_while_playing() {
         let mut game = Game::initial(42);
+        game.phase = GamePhase::Playing;
         game.score = Score { left: 3, right: 5 };
         game.handle_input(InputEvent::Restart);
         assert_eq!(game.score, Score { left: 3, right: 5 });
@@ -453,6 +863,7 @@ mod tests {
         game.handle_input(InputEvent::SetPaddleDirection {
             side: Side::Left,
             direction: Some(Direction::Down),
+            held: true,
         });
         game.tick();
         assert_eq!(game.left_paddle_y, paddle_y);
@@ -460,19 +871,15 @@ mod tests {
     }
 
     #[test]
-    fn serve_is_always_a_45_degree_diagonal_from_center() {
-        for seed in 0..64 {
-            let game = Game::initial(seed);
-            assert_eq!(game.ball.x, FIELD_WIDTH / 2.0);
-            assert_eq!(game.ball.y, FIELD_HEIGHT / 2.0);
-            assert!((game.ball.vx.abs() - BALL_STEP).abs() < 1e-6);
-            assert!((game.ball.vy.abs() - BALL_STEP).abs() < 1e-6);
-        }
-    }
-
-    #[test]
     fn snapshot_mirrors_the_internal_state() {
-        let game = game_with_ball(10.0, 20.0, BALL_STEP, -BALL_STEP);
+        let mut game = Game::initial(42);
+        game.phase = GamePhase::Playing;
+        game.ball = Ball {
+            x: 10.0,
+            y: 20.0,
+            vx: BALL_STEP,
+            vy: -BALL_STEP,
+        };
         let snapshot = game.snapshot();
         assert_eq!(snapshot.phase, GamePhase::Playing);
         assert_eq!(snapshot.score, Score::default());
@@ -485,7 +892,7 @@ mod tests {
     #[test]
     fn default_matches_new_in_shape() {
         let game = Game::default();
-        assert_eq!(game.phase, GamePhase::Playing);
+        assert!(matches!(game.phase, GamePhase::Serving { .. }));
         assert_eq!(game.score, Score::default());
     }
 }

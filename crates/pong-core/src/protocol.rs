@@ -34,9 +34,18 @@ pub enum Direction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputEvent {
     /// Set the direction a paddle should keep moving in (`None` stops it).
+    ///
+    /// `held` reports whether the frontend has confirmed the key is being
+    /// held (its auto-repeat stream has arrived): a confirmed hold moves
+    /// at [`PADDLE_SPEED`](crate::PADDLE_SPEED), anything else at the
+    /// reduced [`PADDLE_TAP_SPEED`](crate::PADDLE_TAP_SPEED) — an
+    /// unconfirmed tap cannot send the paddle halfway across the field
+    /// while release detection is still pending. `held` is meaningless
+    /// when `direction` is `None`.
     SetPaddleDirection {
         side: Side,
         direction: Option<Direction>,
+        held: bool,
     },
     /// Restart the match after a game over.
     Restart,
@@ -47,6 +56,16 @@ pub enum InputEvent {
 /// High-level state of the match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GamePhase {
+    /// Waiting for the next serve: the ball waits at the center and will
+    /// fly toward `toward` when `ticks_left` reaches zero. Paddles can
+    /// still move while serving.
+    Serving {
+        /// Side the ball will fly toward (the player who just lost).
+        toward: Side,
+        /// Ticks until the serve, at [`TICKS_PER_SEC`](crate::TICKS_PER_SEC)
+        /// ticks per second.
+        ticks_left: u16,
+    },
     /// The ball is in play.
     Playing,
     /// Someone reached the winning score.
@@ -86,7 +105,10 @@ pub struct GameSnapshot {
 }
 
 /// Width of the play field in core units; x ranges over `0.0 .. FIELD_WIDTH`.
-pub const FIELD_WIDTH: f32 = 100.0;
+///
+/// Elongated on purpose (7:3) so that crossing the field takes long enough
+/// to react to the ball.
+pub const FIELD_WIDTH: f32 = 140.0;
 
 /// Height of the play field in core units; y ranges over `0.0 .. FIELD_HEIGHT`.
 pub const FIELD_HEIGHT: f32 = 60.0;
