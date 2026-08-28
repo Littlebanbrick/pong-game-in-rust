@@ -38,13 +38,15 @@ pub const PADDLE_INSET: f32 = 5.0;
 pub const BALL_SIZE: f32 = 1.0;
 
 /// Paddle speed in field units per second while the player's key is
-/// confirmed held (its auto-repeat stream has arrived).
-pub const PADDLE_SPEED: f32 = 60.0;
+/// confirmed held (its auto-repeat stream has arrived). Matches the ball
+/// speed: a full-field-height traverse takes 0.75 s.
+pub const PADDLE_SPEED: f32 = 80.0;
 
-/// Paddle speed before the hold is confirmed — a bare tap. Half of the
-/// full speed, so the unavoidable tap-detection window moves the paddle
-/// at most ~0.3 of the field height while staying responsive.
-pub const PADDLE_TAP_SPEED: f32 = PADDLE_SPEED / 2.0;
+/// Paddle speed before the hold is confirmed — a bare tap. Kept at 30
+/// (not a fraction of [`PADDLE_SPEED`]): it is the overshoot guard for
+/// the tap-detection window, whose budget is independent of the max
+/// speed. The window moves the paddle at most ~0.3 of the field height.
+pub const PADDLE_TAP_SPEED: f32 = 30.0;
 
 /// Paddle acceleration while ramping from tap to full speed after the
 /// hold is confirmed, in field units per second squared. Chosen so the
@@ -61,8 +63,21 @@ pub const SERVE_PAUSE_TICKS: u16 = TICKS_PER_SEC as u16;
 /// Steepest bounce angle off a paddle (hit at the paddle edge), in radians.
 pub const MAX_BOUNCE_ANGLE: f32 = std::f32::consts::PI / 3.0;
 
-/// Angle (from horizontal) at which serves leave the center, in radians.
-const SERVE_ANGLE: f32 = std::f32::consts::PI / 6.0;
+/// Serve angle options, in degrees: flat, ±15°, ±30°, ±45°. None steeper
+/// than 45°, and the flat serve is twice as likely as any angle — the
+/// same table shape as the author's FPGA Pong (`Pong-dld`, whose lookup
+/// lists the horizontal entry twice).
+const SERVE_ANGLE_TABLE: [f32; 7] = [0.0, 15.0, -15.0, 30.0, -30.0, 45.0, -45.0];
+
+/// Maps a random roll (0..8) to a serve angle in degrees, doubling the
+/// flat serve (roll 7 maps to the same entry as roll 0).
+fn serve_angle_degrees(roll: u64) -> f32 {
+    let index = match (roll % 8) as usize {
+        7 => 0,
+        other => other,
+    };
+    SERVE_ANGLE_TABLE[index]
+}
 
 const PADDLE_HALF_W: f32 = PADDLE_WIDTH / 2.0;
 const PADDLE_HALF_H: f32 = PADDLE_HEIGHT / 2.0;
@@ -251,17 +266,16 @@ impl Game {
         };
     }
 
-    /// Launches the ball toward `toward` at [`SERVE_ANGLE`] with a random
-    /// vertical sign, keeping the speed magnitude at [`BALL_SPEED`].
+    /// Launches the ball toward `toward` at a random angle from
+    /// [`SERVE_ANGLE_TABLE`], keeping the speed magnitude at [`BALL_SPEED`].
     fn launch_serve(&mut self, toward: Side) {
+        let angle = serve_angle_degrees(self.rng.next_u64()).to_radians();
         let vx = match toward {
-            Side::Left => -BALL_STEP * SERVE_ANGLE.cos(),
-            Side::Right => BALL_STEP * SERVE_ANGLE.cos(),
+            Side::Left => -BALL_STEP * angle.cos(),
+            Side::Right => BALL_STEP * angle.cos(),
         };
-        let vy = BALL_STEP * SERVE_ANGLE.sin();
-        let vy = if self.rng.next_bool() { vy } else { -vy };
         self.ball.vx = vx;
-        self.ball.vy = vy;
+        self.ball.vy = BALL_STEP * angle.sin();
         self.phase = GamePhase::Playing;
     }
 
@@ -525,8 +539,10 @@ mod tests {
         steer(&mut game, Side::Left, Some(Direction::Up), true);
         game.tick();
         let step = game.left_paddle_y - before; // upward: negative
+        // 1e-3: the position accumulates 20 ticks of f32 rounding before
+        // this single-step measurement; far below the step size itself.
         assert!(
-            (step + PADDLE_SPEED * DT).abs() < 1e-6,
+            (step + PADDLE_SPEED * DT).abs() < 1e-3,
             "reversal at full speed stays at full speed"
         );
     }
@@ -573,11 +589,62 @@ mod tests {
                 Side::Right => 1.0,
             };
             assert_eq!(game.ball.vx.signum(), vx_sign);
-            // Speed magnitude is BALL_SPEED, serve angle is SERVE_ANGLE.
+            // Speed magnitude is BALL_SPEED, the angle comes from the table.
             assert!((game.ball.speed() - BALL_STEP).abs() < 1e-6);
-            let angle = (game.ball.vy / game.ball.vx.abs()).atan();
-            assert!((angle.abs() - SERVE_ANGLE).abs() < 1e-6);
+            let angle_deg = (game.ball.vy / game.ball.vx.abs()).atan().to_degrees();
+            assert!(
+                SERVE_ANGLE_TABLE
+                    .iter()
+                    .any(|table_deg| (angle_deg - table_deg).abs() < 1e-4),
+                "serve angle {angle_deg}° not in the table"
+            );
         }
+    }
+
+    /// Every table entry shows up across seeds: no angle is unreachable.
+    #[test]
+    fn serve_angles_cover_the_whole_table() {
+        let mut seen = [false; SERVE_ANGLE_TABLE.len()];
+        for seed in 0..400 {
+            let mut game = Game::initial(seed);
+            play_after_serve(&mut game);
+            let angle_deg = (game.ball.vy / game.ball.vx.abs()).atan().to_degrees();
+            for (i, table_deg) in SERVE_ANGLE_TABLE.iter().enumerate() {
+                if (angle_deg - table_deg).abs() < 1e-4 {
+                    seen[i] = true;
+                }
+            }
+        }
+        assert!(
+            seen.iter().all(|entry| *entry),
+            "unreachable angles: {seen:?}"
+        );
+    }
+
+    /// The flat serve is twice as likely as any single angle: with the
+    /// doubled table entry it must appear noticeably more often than
+    /// each angled option.
+    #[test]
+    fn flat_serve_is_doubly_weighted() {
+        let mut flat = 0;
+        let mut one_angle = 0;
+        for seed in 0..800 {
+            let mut game = Game::initial(seed);
+            play_after_serve(&mut game);
+            if game.ball.vy.abs() < 1e-9 {
+                flat += 1;
+            } else if (game.ball.vy / game.ball.vx.abs()).atan().to_degrees() > 37.0 {
+                // +45° is one specific angled entry. The cut sits midway
+                // between 30° and 45° so f32 tan/atan round-trip noise on
+                // the 30° serves cannot leak into this bucket.
+                one_angle += 1;
+            }
+        }
+        // Expected: flat ≈ 2/8, one angled entry ≈ 1/8 of 800.
+        assert!(
+            flat > one_angle * 3 / 2,
+            "flat {flat} should clearly outweigh one angle {one_angle}"
+        );
     }
 
     #[test]
