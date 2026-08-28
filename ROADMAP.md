@@ -7,7 +7,7 @@
 - 交付：协作文档（CLAUDE / ARCHITECTURE / ROADMAP）、空 workspace 骨架、CI、连接远端并首推。
 - 验收：本地 `cargo build` 通过；GitHub Actions 绿勾。
 
-## 第 1 阶段：最小 demo（进行中）
+## 第 1 阶段：最小 demo ✅（已发布 `v0.1.0`）
 
 - 目标：可玩的双人本地对战。
 - 范围：
