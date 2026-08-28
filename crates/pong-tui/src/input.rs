@@ -8,8 +8,12 @@
 //! means "still held", and a silent gap means "released".
 //!
 //! Consequences (see the timeout constants):
-//! * once the repeat stream is flowing, a release is detected within
-//!   [`RELEASE_TIMEOUT`] of the last event;
+//! * once the repeat stream is flowing, a release is detected within an
+//!   **adaptive window**: the stream's measured interval (EWMA over
+//!   confirmed-to-confirmed arrivals) times [`RELEASE_TIMEOUT_INTERVALS`],
+//!   clamped to [`RELEASE_TIMEOUT_MIN`]..=[`RELEASE_TIMEOUT`]. A typical
+//!   30 Hz stream yields a ~75 ms window; the fallback before any
+//!   interval has been measured is [`RELEASE_TIMEOUT`];
 //! * before the first repeat arrives (the OS repeat delay, ~500 ms with
 //!   default settings), a gap is only conclusive after
 //!   [`HOLD_START_TIMEOUT`], so a quick tap moves the paddle for up to
@@ -25,9 +29,19 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use pong_core::{Direction, InputEvent, Side};
 
-/// How long a key that is auto-repeating may stay silent before it is
-/// considered released.
+/// Upper bound (and pre-measurement fallback) of the adaptive window
+/// after which a repeating key that went silent is considered released.
 pub const RELEASE_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Lower bound of the adaptive release window. Protects a jittery stream
+/// whose measured interval would otherwise shrink the window below the
+/// stream's own noise.
+pub const RELEASE_TIMEOUT_MIN: Duration = Duration::from_millis(60);
+
+/// How many measured repeat intervals a key may stay silent before it is
+/// considered released. Two-and-a-half intervals tolerates a couple of
+/// lost events while still braking noticeably sooner than the ceiling.
+const RELEASE_TIMEOUT_INTERVALS: f32 = 2.5;
 
 /// How long to wait for the first auto-repeat after a press. Must exceed
 /// the OS key-repeat delay (~500 ms with common default settings).
@@ -52,12 +66,41 @@ struct KeyHold {
     /// signal) or an explicit `Repeat`/`Release` kind. Unconfirmed keys
     /// still move the paddle, but at the reduced tap speed.
     confirmed: bool,
+    /// EWMA of the auto-repeat interval, sampled between confirmed
+    /// arrivals only: the first gap after a press carries the OS repeat
+    /// delay (~500 ms), not the stream's rhythm, and must not poison
+    /// the estimate. `None` until the first rhythm sample.
+    repeat_interval: Option<Duration>,
+}
+
+/// Folds one measured interval into the running estimate (weight 0.5 on
+/// the new sample: converges within a few events).
+fn fold_interval(prev: Option<Duration>, sample: Duration) -> Option<Duration> {
+    match prev {
+        None => Some(sample),
+        Some(prev) => Some(Duration::from_secs_f32(
+            0.5 * prev.as_secs_f32() + 0.5 * sample.as_secs_f32(),
+        )),
+    }
+}
+
+/// The adaptive silence window of a confirmed key: measured interval
+/// times [`RELEASE_TIMEOUT_INTERVALS`], clamped; the conservative
+/// [`RELEASE_TIMEOUT`] until a rhythm has been measured at all.
+fn release_window(interval: Option<Duration>) -> Duration {
+    match interval {
+        Some(interval) => {
+            Duration::from_secs_f32(interval.as_secs_f32() * RELEASE_TIMEOUT_INTERVALS)
+                .clamp(RELEASE_TIMEOUT_MIN, RELEASE_TIMEOUT)
+        }
+        None => RELEASE_TIMEOUT,
+    }
 }
 
 impl KeyHold {
     fn expired(&self, now: Instant) -> bool {
         let timeout = if self.confirmed {
-            RELEASE_TIMEOUT
+            release_window(self.repeat_interval)
         } else {
             HOLD_START_TIMEOUT
         };
@@ -186,11 +229,22 @@ impl InputState {
             // so does an explicit `Repeat` kind: either way the hold is
             // confirmed.
             let was_held = slot.is_some();
-            let confirmed = was_held || matches!(key.kind, KeyEventKind::Repeat);
-            *slot = Some(KeyHold {
-                last_seen: now,
-                confirmed,
-            });
+            if let Some(hold) = slot.as_mut() {
+                // Measure the rhythm only between confirmed arrivals: the
+                // first gap after the press is the OS repeat delay.
+                if hold.confirmed {
+                    hold.repeat_interval =
+                        fold_interval(hold.repeat_interval, now.duration_since(hold.last_seen));
+                }
+                hold.last_seen = now;
+                hold.confirmed = true;
+            } else {
+                *slot = Some(KeyHold {
+                    last_seen: now,
+                    confirmed: matches!(key.kind, KeyEventKind::Repeat),
+                    repeat_interval: None,
+                });
+            }
             // Only genuine presses update the tie-breaker: interleaved
             // repeat streams must not flip the winner back and forth.
             if !was_held {
@@ -347,9 +401,91 @@ mod tests {
         state.handle_key(key(KeyCode::Char('s')), at(base, 500));
         state.handle_key(key(KeyCode::Char('s')), at(base, 533));
         state.handle_key(key(KeyCode::Char('s')), at(base, 566));
-        assert!(state.sweep(at(base, 700)).is_empty(), "still repeating");
+        // The measured 33 ms rhythm tightens the window to ~82.5 ms, so
+        // this stream is alive only while events keep flowing.
+        assert!(state.sweep(at(base, 640)).is_empty(), "still repeating");
         assert_eq!(
-            state.sweep(at(base, 720)),
+            state.sweep(at(base, 660)),
+            vec![send(Side::Left, None, false)]
+        );
+    }
+
+    /// The release window tightens to the stream's measured rhythm:
+    /// two 30 ms samples give a 75 ms window — 90 ms of silence stops.
+    #[test]
+    fn release_window_adapts_to_the_repeat_rhythm() {
+        let base = Instant::now();
+        let mut state = InputState::new();
+        state.handle_key(key(KeyCode::Char('w')), at(base, 0));
+        state.handle_key(key(KeyCode::Char('w')), at(base, 500));
+        state.handle_key(key(KeyCode::Char('w')), at(base, 530));
+        state.handle_key(key(KeyCode::Char('w')), at(base, 560));
+        assert!(
+            state.sweep(at(base, 620)).is_empty(),
+            "60 ms of silence is within the 75 ms window"
+        );
+        assert_eq!(
+            state.sweep(at(base, 650)),
+            vec![send(Side::Left, None, false)]
+        );
+    }
+
+    /// A slow repeat stream (10 Hz) would want a 250 ms window; the
+    /// ceiling keeps it at the conservative 150 ms.
+    #[test]
+    fn slow_repeat_stream_gets_the_conservative_window() {
+        let base = Instant::now();
+        let mut state = InputState::new();
+        state.handle_key(key(KeyCode::Char('w')), at(base, 0));
+        state.handle_key(key(KeyCode::Char('w')), at(base, 500));
+        state.handle_key(key(KeyCode::Char('w')), at(base, 600));
+        state.handle_key(key(KeyCode::Char('w')), at(base, 700));
+        assert!(
+            state.sweep(at(base, 840)).is_empty(),
+            "140 ms of silence is within the clamped 150 ms window"
+        );
+        assert_eq!(
+            state.sweep(at(base, 860)),
+            vec![send(Side::Left, None, false)]
+        );
+    }
+
+    /// A pathologically fast measurement must not shrink the window
+    /// below the floor (60 ms), or stream jitter would false-release.
+    #[test]
+    fn fast_estimate_never_shrinks_below_the_floor() {
+        let base = Instant::now();
+        let mut state = InputState::new();
+        state.handle_key(key(KeyCode::Char('w')), at(base, 0));
+        state.handle_key(key(KeyCode::Char('w')), at(base, 500));
+        state.handle_key(key(KeyCode::Char('w')), at(base, 520));
+        state.handle_key(key(KeyCode::Char('w')), at(base, 540));
+        assert!(
+            state.sweep(at(base, 590)).is_empty(),
+            "50 ms of silence is within the 60 ms floor"
+        );
+        assert_eq!(
+            state.sweep(at(base, 615)),
+            vec![send(Side::Left, None, false)]
+        );
+    }
+
+    /// The OS repeat delay (~500 ms) between press and first repeat is
+    /// not the rhythm: it must not be folded into the estimate, or the
+    /// window would stay at the 150 ms ceiling forever.
+    #[test]
+    fn initial_repeat_delay_is_not_measured_as_rhythm() {
+        let base = Instant::now();
+        let mut state = InputState::new();
+        state.handle_key(key(KeyCode::Char('w')), at(base, 0));
+        state.handle_key(key(KeyCode::Char('w')), at(base, 500));
+        state.handle_key(key(KeyCode::Char('w')), at(base, 530));
+        state.handle_key(key(KeyCode::Char('w')), at(base, 560));
+        // Rhythm is 30 ms → window 75 ms: 100 ms of silence must stop
+        // the paddle. Had the 500 ms delay polluted the estimate, the
+        // window would still sit at the 150 ms ceiling here.
+        assert_eq!(
+            state.sweep(at(base, 660)),
             vec![send(Side::Left, None, false)]
         );
     }
