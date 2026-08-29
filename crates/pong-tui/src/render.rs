@@ -37,8 +37,8 @@ impl CourtGeometry {
         let rows = available.height.min(rows_by_width).max(1);
         let cols = available.width.min((rows as u32 * 14 / 3) as u16).max(1);
         let area = Rect {
-            x: available.x + (available.width - cols) / 2,
-            y: available.y + (available.height - rows) / 2,
+            x: available.x + available.width.saturating_sub(cols) / 2,
+            y: available.y + available.height.saturating_sub(rows) / 2,
             width: cols,
             height: rows,
         };
@@ -72,6 +72,11 @@ impl CourtGeometry {
 /// `score_flash` styles the score line while the score-flash effect is on
 /// (the frontend blinks it for a short moment after a point).
 pub fn draw(frame: &mut Frame<'_>, snapshot: &GameSnapshot, score_flash: bool) {
+    // A zero-sized terminal (a headless pty, a pipe) cannot hold a
+    // court; drawing into one would index outside the buffer.
+    if frame.area().width == 0 || frame.area().height == 0 {
+        return;
+    }
     let [score_area, court_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -254,6 +259,15 @@ mod tests {
     #[test]
     fn tiny_terminals_still_yield_a_non_empty_court() {
         let area = CourtGeometry::fit(rect(6, 2)).area();
+        assert!(area.width >= 1);
+        assert!(area.height >= 1);
+    }
+
+    /// A zero-sized area (headless pty, pipe) must not underflow the
+    /// centering arithmetic.
+    #[test]
+    fn zero_sized_terminals_do_not_panic() {
+        let area = CourtGeometry::fit(rect(0, 0)).area();
         assert!(area.width >= 1);
         assert!(area.height >= 1);
     }
