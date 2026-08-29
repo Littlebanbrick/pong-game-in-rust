@@ -16,8 +16,8 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use pong_core::{
-    Direction, FIELD_HEIGHT, FIELD_WIDTH, Game, GamePhase, InputEvent, PADDLE_HEIGHT, PADDLE_INSET,
-    Side,
+    Direction, FIELD_HEIGHT, FIELD_WIDTH, Game, GameOptions, GamePhase, InputEvent, PADDLE_HEIGHT,
+    PADDLE_INSET, Side,
 };
 
 /// Terminal view size, chosen for how it looks on screen, not in core
@@ -53,6 +53,9 @@ impl Drop for TerminalGuard {
 fn main() -> io::Result<()> {
     let _guard = TerminalGuard::new()?;
     let mut game = Game::new();
+    // A fresh game waits for options; this harness always starts a
+    // plain two-player match with the fast ball.
+    game.begin_match(GameOptions::default());
     let mut quit = false;
     let mut tick_index: u32 = 0;
 

@@ -30,6 +30,59 @@ pub enum Direction {
     Down,
 }
 
+/// AI difficulty tier. See ARCHITECTURE.md for the parameter table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Difficulty {
+    /// ~200 ms reaction, noisy target, tracks the ball's current
+    /// height only, 60% paddle speed.
+    Easy,
+    /// ~100 ms reaction, moderate noise, linear intercept prediction
+    /// (wall reflections not folded), full paddle speed.
+    Normal,
+    /// ~33 ms reaction, no noise, full trajectory prediction with wall
+    /// reflections folded in, full paddle speed.
+    Hard,
+}
+
+/// Who plays the right paddle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opponent {
+    /// Two humans: left plays W/S, right plays ↑/↓.
+    TwoPlayer,
+    /// The backend drives the right paddle.
+    Ai(Difficulty),
+}
+
+/// Ball speed mode chosen at the start menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BallSpeedMode {
+    /// Constant 60 units/s.
+    Slow,
+    /// Constant 80 units/s (the phase-2 default).
+    Fast,
+    /// Starts at 60 units/s, ×1.1 per paddle hit with no cap; resets at
+    /// each new round. Wall bounces never change the speed.
+    Mutable,
+}
+
+/// Match configuration, sent from the start menu via
+/// [`InputEvent::StartMatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameOptions {
+    pub opponent: Opponent,
+    pub ball_speed: BallSpeedMode,
+}
+
+impl Default for GameOptions {
+    /// The phase-2 behavior, unchanged: two humans, fast ball.
+    fn default() -> Self {
+        Self {
+            opponent: Opponent::TwoPlayer,
+            ball_speed: BallSpeedMode::Fast,
+        }
+    }
+}
+
 /// An input command sent from the frontend to the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputEvent {
@@ -47,7 +100,11 @@ pub enum InputEvent {
         direction: Option<Direction>,
         held: bool,
     },
-    /// Restart the match after a game over.
+    /// Start (or restart) a match with the given configuration. Sent when
+    /// the player confirms the start menu; also accepted mid-match and
+    /// after a game over — the current match is discarded either way.
+    StartMatch(GameOptions),
+    /// Restart the match after a game over, keeping the configuration.
     Restart,
     /// Shut the backend down.
     Shutdown,
@@ -56,6 +113,10 @@ pub enum InputEvent {
 /// High-level state of the match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GamePhase {
+    /// The backend is up but no match is running: the ball parks at the
+    /// center and nothing moves until a [`InputEvent::StartMatch`]
+    /// arrives. Paddles can still move.
+    Waiting,
     /// Waiting for the next serve: the ball waits at the center and will
     /// fly toward `toward` when `ticks_left` reaches zero. Paddles can
     /// still move while serving.

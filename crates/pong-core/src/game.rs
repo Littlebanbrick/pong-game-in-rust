@@ -15,8 +15,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::protocol::{
-    Direction, FIELD_HEIGHT, FIELD_WIDTH, GameEvent, GamePhase, GameSnapshot, InputEvent, Score,
-    Side,
+    BallSpeedMode, Direction, FIELD_HEIGHT, FIELD_WIDTH, GameEvent, GameOptions, GamePhase,
+    GameSnapshot, InputEvent, Score, Side,
 };
 
 /// Simulation rate of the backend, in ticks per second.
@@ -54,9 +54,28 @@ pub const PADDLE_TAP_SPEED: f32 = 30.0;
 /// ramp takes ~250 ms.
 pub const PADDLE_ACCEL: f32 = (PADDLE_SPEED - PADDLE_TAP_SPEED) / 0.25;
 
-/// Ball speed (path length) in field units per second. The resultant speed
-/// magnitude never changes; only its direction does.
+/// Ball speed (path length) in field units per second in the `Fast`
+/// mode — the phase-2 default. The resultant speed magnitude never
+/// changes direction-only bounces; only the mutable mode grows it.
 pub const BALL_SPEED: f32 = 80.0;
+
+/// Ball speed in the `Slow` mode, and the starting speed of every round
+/// in the `Mutable` mode, in field units per second.
+pub const BALL_SPEED_SLOW: f32 = 60.0;
+
+/// Speed multiplier applied on every paddle hit in the `Mutable` mode.
+/// Wall bounces never change the speed.
+pub const MUTABLE_GROWTH: f32 = 1.1;
+
+impl BallSpeedMode {
+    /// Ball speed at the start of a round, in field units per second.
+    pub fn start_speed(self) -> f32 {
+        match self {
+            BallSpeedMode::Slow | BallSpeedMode::Mutable => BALL_SPEED_SLOW,
+            BallSpeedMode::Fast => BALL_SPEED,
+        }
+    }
+}
 
 /// Pause between a point and the next serve, in ticks.
 pub const SERVE_PAUSE_TICKS: u16 = TICKS_PER_SEC as u16;
@@ -84,7 +103,8 @@ const PADDLE_HALF_W: f32 = PADDLE_WIDTH / 2.0;
 const PADDLE_HALF_H: f32 = PADDLE_HEIGHT / 2.0;
 const BALL_HALF: f32 = BALL_SIZE / 2.0;
 
-/// Ball displacement per tick at [`BALL_SPEED`].
+/// Ball displacement per tick at [`BALL_SPEED`] — the test workload.
+#[cfg(test)]
 const BALL_STEP: f32 = BALL_SPEED * DT;
 
 /// Ball position and velocity (center coordinates, field units).
@@ -120,22 +140,38 @@ pub struct Game {
     rng: Xorshift,
     /// Events of the current tick, handed out by the next `snapshot()`.
     pending_events: Vec<GameEvent>,
+    /// Configuration of the current (or upcoming) match.
+    options: GameOptions,
+    /// Current ball speed magnitude in units per second — constant in the
+    /// Slow/Fast modes, grown by every paddle hit in the Mutable mode.
+    ball_speed: f32,
 }
 
 impl Game {
-    /// Creates a game paused before the first serve (random direction).
+    /// Creates a game in the [`Waiting`](GamePhase::Waiting) phase: no
+    /// match is running until a [`InputEvent::StartMatch`] arrives.
     pub fn new() -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before UNIX epoch")
             .as_nanos() as u64;
-        Self::initial(nanos)
+        Self::waiting(nanos)
     }
 
-    /// Creates a game with a deterministic seed (used by `new` and tests).
+    /// Creates a game with a deterministic seed (used by tests),
+    /// immediately starting a default match (two players, fast ball) —
+    /// the phase-2 behavior.
+    #[cfg(test)]
     fn initial(seed: u64) -> Self {
-        let mut game = Game {
-            phase: GamePhase::Playing,
+        let mut game = Self::waiting(seed);
+        game.begin_match(GameOptions::default());
+        game
+    }
+
+    /// Creates a game parked in the waiting phase with default options.
+    fn waiting(seed: u64) -> Self {
+        Game {
+            phase: GamePhase::Waiting,
             score: Score::default(),
             left_paddle_y: FIELD_HEIGHT / 2.0,
             right_paddle_y: FIELD_HEIGHT / 2.0,
@@ -146,22 +182,22 @@ impl Game {
             left_speed: 0.0,
             right_speed: 0.0,
             ball: Ball {
-                x: 0.0,
-                y: 0.0,
+                x: FIELD_WIDTH / 2.0,
+                y: FIELD_HEIGHT / 2.0,
                 vx: 0.0,
                 vy: 0.0,
             },
             rng: Xorshift::new(seed),
             pending_events: Vec::new(),
-        };
-        // The opening serve goes to a random side.
-        let toward = if game.rng.next_bool() {
-            Side::Left
-        } else {
-            Side::Right
-        };
-        game.begin_serve(toward);
-        game
+            options: GameOptions::default(),
+            ball_speed: BALL_SPEED,
+        }
+    }
+
+    /// Starts a fresh match with `options`, discarding any current one.
+    pub fn begin_match(&mut self, options: GameOptions) {
+        self.options = options;
+        self.reset();
     }
 
     /// Applies one input event from the frontend.
@@ -181,6 +217,7 @@ impl Game {
                     self.right_held = held;
                 }
             },
+            InputEvent::StartMatch(options) => self.begin_match(options),
             InputEvent::Restart => {
                 if matches!(self.phase, GamePhase::GameOver { .. }) {
                     self.reset();
@@ -193,12 +230,17 @@ impl Game {
 
     /// Advances the simulation by one tick.
     ///
+    /// * [`GamePhase::Waiting`] — no match running; paddles still move.
     /// * [`GamePhase::Serving`] — paddles keep moving, the ball waits at
     ///   the center until the countdown runs out.
     /// * [`GamePhase::Playing`] — full simulation.
     /// * [`GamePhase::GameOver`] — everything freezes until a restart.
     pub fn tick(&mut self) {
         match self.phase {
+            GamePhase::Waiting => {
+                self.move_paddle(Side::Left);
+                self.move_paddle(Side::Right);
+            }
             GamePhase::Serving { toward, ticks_left } => {
                 self.move_paddle(Side::Left);
                 self.move_paddle(Side::Right);
@@ -259,12 +301,15 @@ impl Game {
         self.begin_serve(toward);
     }
 
-    /// Enters the serving pause: ball parked at the center, velocity zero.
+    /// Enters the serving pause: ball parked at the center, velocity
+    /// zero, speed back to the mode's round-start value (the mutable
+    /// mode's growth does not survive a point).
     fn begin_serve(&mut self, toward: Side) {
         self.phase = GamePhase::Serving {
             toward,
             ticks_left: SERVE_PAUSE_TICKS,
         };
+        self.ball_speed = self.options.ball_speed.start_speed();
         self.ball = Ball {
             x: FIELD_WIDTH / 2.0,
             y: FIELD_HEIGHT / 2.0,
@@ -274,15 +319,17 @@ impl Game {
     }
 
     /// Launches the ball toward `toward` at a random angle from
-    /// [`SERVE_ANGLE_TABLE`], keeping the speed magnitude at [`BALL_SPEED`].
+    /// [`SERVE_ANGLE_TABLE`], keeping the speed magnitude at the current
+    /// [`ball_speed`](Game) value.
     fn launch_serve(&mut self, toward: Side) {
         let angle = serve_angle_degrees(self.rng.next_u64()).to_radians();
+        let step = self.ball_speed * DT;
         let vx = match toward {
-            Side::Left => -BALL_STEP * angle.cos(),
-            Side::Right => BALL_STEP * angle.cos(),
+            Side::Left => -step * angle.cos(),
+            Side::Right => step * angle.cos(),
         };
         self.ball.vx = vx;
-        self.ball.vy = BALL_STEP * angle.sin();
+        self.ball.vy = step * angle.sin();
         self.phase = GamePhase::Playing;
     }
 
@@ -352,20 +399,26 @@ impl Game {
 
         // Where the ball hit the paddle, from -1 (below the paddle center)
         // to +1 (above it). Steep returns come from the edges, flat ones
-        // from the center. Only the direction changes; the resultant speed
-        // magnitude is kept at BALL_SPEED.
+        // from the center. Only the direction changes; the speed
+        // magnitude is kept — except in the mutable mode, where every
+        // paddle hit grows it by MUTABLE_GROWTH.
+        if self.options.ball_speed == BallSpeedMode::Mutable {
+            self.ball_speed *= MUTABLE_GROWTH;
+        }
         let offset = ((self.ball.y - paddle_y) / PADDLE_HALF_H).clamp(-1.0, 1.0);
         let angle = offset * MAX_BOUNCE_ANGLE;
+        let step = self.ball_speed * DT;
         let (dir_x, dir_y) = match side {
             Side::Left => (1.0, 1.0),
             Side::Right => (-1.0, 1.0),
         };
-        self.ball.vx = dir_x * BALL_STEP * angle.cos();
-        self.ball.vy = dir_y * BALL_STEP * angle.sin();
+        self.ball.vx = dir_x * step * angle.cos();
+        self.ball.vy = dir_y * step * angle.sin();
 
         // The invariant the whole physics rests on: bounces change only
-        // the direction, never the speed magnitude.
-        debug_assert!((self.ball.speed() - BALL_STEP).abs() < 1e-5);
+        // the direction (and, in the mutable mode, apply exactly one
+        // growth step) — never anything else about the magnitude.
+        debug_assert!((self.ball.speed() - step).abs() < 1e-5);
 
         // Push the ball out of the paddle so the overlap test cannot fire
         // again on the next tick.
@@ -406,17 +459,17 @@ impl Default for Game {
 }
 
 /// Tiny xorshift generator — just enough randomness to pick serve
-/// directions without adding a dependency.
+/// directions without adding a dependency. Shared with the AI module.
 #[derive(Debug)]
-struct Xorshift(u64);
+pub(crate) struct Xorshift(u64);
 
 impl Xorshift {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         // `| 1` guarantees a non-zero state (a zero state would never change).
         Xorshift((seed ^ 0x9E37_79B9_7F4A_7C15) | 1)
     }
 
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x << 13;
         x ^= x >> 7;
@@ -433,6 +486,7 @@ impl Xorshift {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::Opponent;
 
     const CENTER_Y: f32 = FIELD_HEIGHT / 2.0;
     const LEFT_PADDLE_X: f32 = PADDLE_INSET;
@@ -1004,7 +1058,157 @@ mod tests {
     #[test]
     fn default_matches_new_in_shape() {
         let game = Game::default();
+        // A fresh game waits for match options; nothing is running yet.
+        assert_eq!(game.phase, GamePhase::Waiting);
+        assert_eq!(game.score, Score::default());
+        assert_eq!(game.ball.x, FIELD_WIDTH / 2.0);
+        assert_eq!(game.ball.y, FIELD_HEIGHT / 2.0);
+    }
+
+    /// The per-tick displacement the mutable mode starts each round at.
+    const SLOW_STEP: f32 = BALL_SPEED_SLOW * DT;
+
+    fn options(opponent: Opponent, ball_speed: BallSpeedMode) -> GameOptions {
+        GameOptions {
+            opponent,
+            ball_speed,
+        }
+    }
+
+    #[test]
+    fn waiting_game_parks_the_ball_but_moves_paddles() {
+        let mut game = Game::waiting(42);
+        assert_eq!(game.phase, GamePhase::Waiting);
+        steer(&mut game, Side::Left, Some(Direction::Up), true);
+        let before = game.left_paddle_y;
+        game.tick();
+        assert!(game.left_paddle_y < before, "paddles stay alive");
+        assert_eq!(game.ball.x, FIELD_WIDTH / 2.0, "ball stays parked");
+    }
+
+    #[test]
+    fn start_match_begins_serving_with_the_chosen_speed() {
+        let mut game = Game::waiting(42);
+        game.handle_input(InputEvent::StartMatch(options(
+            Opponent::TwoPlayer,
+            BallSpeedMode::Slow,
+        )));
+        assert!(matches!(game.phase, GamePhase::Serving { .. }));
+        play_after_serve(&mut game);
+        assert!((game.ball.speed() - SLOW_STEP).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fast_mode_launches_at_the_phase2_speed() {
+        let mut game = Game::waiting(42);
+        game.handle_input(InputEvent::StartMatch(options(
+            Opponent::TwoPlayer,
+            BallSpeedMode::Fast,
+        )));
+        play_after_serve(&mut game);
+        assert!((game.ball.speed() - BALL_STEP).abs() < 1e-6);
+    }
+
+    #[test]
+    fn start_match_discards_a_running_match() {
+        let mut game = Game::initial(42);
+        play_after_serve(&mut game);
+        game.score.record(Side::Left);
+        game.handle_input(InputEvent::StartMatch(options(
+            Opponent::TwoPlayer,
+            BallSpeedMode::Slow,
+        )));
         assert!(matches!(game.phase, GamePhase::Serving { .. }));
         assert_eq!(game.score, Score::default());
+    }
+
+    #[test]
+    fn mutable_speed_grows_per_paddle_hit_and_resets_each_round() {
+        let mut game = Game::initial(42);
+        game.begin_match(options(Opponent::TwoPlayer, BallSpeedMode::Mutable));
+        play_after_serve(&mut game);
+        assert!(
+            (game.ball.speed() - SLOW_STEP).abs() < 1e-6,
+            "a mutable round starts at the slow speed"
+        );
+
+        // Two paddle hits: one from each side.
+        game.ball = Ball {
+            x: LEFT_EDGE - 0.1,
+            y: CENTER_Y,
+            vx: -SLOW_STEP,
+            vy: 0.0,
+        };
+        game.left_paddle_y = CENTER_Y;
+        game.tick();
+        let once = BALL_SPEED_SLOW * MUTABLE_GROWTH * DT;
+        assert!(
+            (game.ball.speed() - once).abs() < 1e-5,
+            "first paddle hit: {}",
+            game.ball.speed()
+        );
+        game.ball = Ball {
+            x: RIGHT_EDGE + 0.1,
+            y: CENTER_Y,
+            vx: once,
+            vy: 0.0,
+        };
+        game.right_paddle_y = CENTER_Y;
+        game.tick();
+        let twice = BALL_SPEED_SLOW * MUTABLE_GROWTH * MUTABLE_GROWTH * DT;
+        assert!(
+            (game.ball.speed() - twice).abs() < 1e-4,
+            "second paddle hit: {}",
+            game.ball.speed()
+        );
+
+        // A point ends the round; the next one starts slow again.
+        game.ball = Ball {
+            x: -BALL_HALF - 0.1,
+            y: CENTER_Y,
+            vx: -twice,
+            vy: 0.0,
+        };
+        game.tick();
+        assert!(matches!(game.phase, GamePhase::Serving { .. }));
+        play_after_serve(&mut game);
+        assert!(
+            (game.ball.speed() - SLOW_STEP).abs() < 1e-6,
+            "a new round resets the mutable speed"
+        );
+    }
+
+    #[test]
+    fn wall_bounces_never_grow_the_mutable_ball() {
+        let mut game = Game::initial(42);
+        game.begin_match(options(Opponent::TwoPlayer, BallSpeedMode::Mutable));
+        play_after_serve(&mut game);
+        // Steeply up into the top wall; only a paddle hit may grow it.
+        game.ball = Ball {
+            x: FIELD_WIDTH / 2.0,
+            y: BALL_HALF - 0.1,
+            vx: 0.0,
+            vy: -SLOW_STEP,
+        };
+        game.tick();
+        assert!(game.ball.vy > 0.0, "the wall flipped vy");
+        assert!(
+            (game.ball.speed() - SLOW_STEP).abs() < 1e-6,
+            "wall bounces keep the speed"
+        );
+    }
+
+    #[test]
+    fn restart_after_game_over_keeps_the_match_options() {
+        let mut game = Game::initial(42);
+        game.begin_match(options(Opponent::TwoPlayer, BallSpeedMode::Mutable));
+        game.phase = GamePhase::GameOver { winner: Side::Left };
+        game.handle_input(InputEvent::Restart);
+        assert!(matches!(game.phase, GamePhase::Serving { .. }));
+        play_after_serve(&mut game);
+        assert!(
+            (game.ball.speed() - SLOW_STEP).abs() < 1e-6,
+            "restart keeps the mutable mode (slow start)"
+        );
     }
 }

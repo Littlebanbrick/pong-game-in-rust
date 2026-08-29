@@ -139,23 +139,36 @@ fn run_backend(input: Receiver<InputEvent>, snapshots: Sender<GameSnapshot>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Direction, GamePhase, Side};
+    use crate::{Direction, GameOptions, GamePhase, Side};
 
     #[test]
     fn snapshots_stream_at_least_once_per_tick() {
         let backend = Backend::spawn();
-        // A fresh game starts in the serving pause; the countdown must
-        // advance between two consecutive snapshots.
-        let first = backend.next_snapshot().expect("first snapshot");
-        let second = backend.next_snapshot().expect("second snapshot");
-        match (first.phase, second.phase) {
-            (
-                GamePhase::Serving { ticks_left: a, .. },
-                GamePhase::Serving { ticks_left: b, .. },
-            ) => assert_eq!(a, b + 1),
-            (a, b) => panic!("expected serving phases, got {a:?} -> {b:?}"),
+        // A fresh backend waits for match options; send them and check
+        // that the serving countdown advances between two consecutive
+        // snapshots. (Waiting-phase snapshots are identical to each
+        // other, so the comparison only becomes meaningful once the
+        // match starts.)
+        backend.send(InputEvent::StartMatch(GameOptions::default()));
+        let mut prev = backend.next_snapshot().expect("snapshot");
+        for _ in 0..10 {
+            let next = backend.next_snapshot().expect("snapshot");
+            match (prev.phase, next.phase) {
+                (
+                    GamePhase::Serving { ticks_left: a, .. },
+                    GamePhase::Serving { ticks_left: b, .. },
+                ) => {
+                    assert_eq!(a, b + 1);
+                    backend.join();
+                    return;
+                }
+                (GamePhase::Waiting, GamePhase::Serving { .. })
+                | (GamePhase::Waiting, GamePhase::Waiting) => {}
+                (a, b) => panic!("unexpected phases {a:?} -> {b:?}"),
+            }
+            prev = next;
         }
-        backend.join();
+        panic!("match never started serving");
     }
 
     #[test]
@@ -192,15 +205,23 @@ mod tests {
     #[test]
     fn latest_snapshot_drains_the_queue() {
         let backend = Backend::spawn();
-        // Let some ticks queue up.
-        thread::sleep(Duration::from_millis(100));
-        let latest = backend.latest_snapshot().expect("queued snapshot");
+        // Start a match first: a waiting backend emits perfectly
+        // identical snapshots (ball parked, no countdown), while a
+        // serving one always ticks its countdown — that difference is
+        // what proves a post-drain snapshot is a *new* one.
+        backend.send(InputEvent::StartMatch(GameOptions::default()));
+        let latest = loop {
+            match backend.latest_snapshot() {
+                Some(snapshot) if !matches!(snapshot.phase, GamePhase::Waiting) => break snapshot,
+                _ => thread::sleep(Duration::from_millis(5)),
+            }
+        };
         // After draining, the queue is empty (beyond at most one new tick).
         let drained = backend.latest_snapshot();
         if let Some(newer) = drained {
             // Adjacent ticks always differ somehow: during the serving
-            // pause the ball is parked at the center while `ticks_left`
-            // (inside the phase) advances; once playing, the ball moves.
+            // pause the countdown (inside the phase) advances; once
+            // playing, the ball moves.
             assert!(
                 newer.phase != latest.phase
                     || newer.ball_x != latest.ball_x
