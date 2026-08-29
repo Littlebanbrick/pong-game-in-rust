@@ -6,7 +6,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Style;
 use ratatui::symbols::border;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph};
@@ -73,6 +73,9 @@ impl CourtGeometry {
 /// (the frontend blinks it for a short moment after a point).
 /// `ai_opponent` switches the footer hints: in AI matches the arrow keys
 /// belong to the left paddle.
+///
+/// Everything renders in the terminal's default foreground — no colors.
+/// Emphasis comes from bold/reversed text only.
 pub fn draw(frame: &mut Frame<'_>, snapshot: &GameSnapshot, score_flash: bool, ai_opponent: bool) {
     // A zero-sized terminal (a headless pty, a pipe) cannot hold a
     // court; drawing into one would index outside the buffer.
@@ -102,7 +105,7 @@ pub fn draw(frame: &mut Frame<'_>, snapshot: &GameSnapshot, score_flash: bool, a
         ));
     }
     let score_style = if score_flash {
-        Style::new().yellow().bold()
+        Style::new().bold().reversed()
     } else {
         Style::new().bold()
     };
@@ -122,12 +125,7 @@ pub fn draw(frame: &mut Frame<'_>, snapshot: &GameSnapshot, score_flash: bool, a
         width: court.width + 2,
         height: court.height + 2,
     };
-    frame.render_widget(
-        Block::bordered()
-            .border_set(border::PLAIN)
-            .border_style(Style::new().cyan()),
-        bordered,
-    );
+    frame.render_widget(Block::bordered().border_set(border::PLAIN), bordered);
 
     draw_net(frame, &geometry);
     draw_paddle(frame, &geometry, Side::Left, snapshot.left_paddle_y);
@@ -136,9 +134,7 @@ pub fn draw(frame: &mut Frame<'_>, snapshot: &GameSnapshot, score_flash: bool, a
     let (ball_col, ball_row) = geometry.cell(snapshot.ball_x, snapshot.ball_y);
     // A filled block, not a circle: round glyphs appear to hop between the
     // tall terminal cells, a solid square reads as smooth motion.
-    frame.buffer_mut()[(ball_col, ball_row)]
-        .set_char('█')
-        .set_style(Style::new().yellow());
+    frame.buffer_mut()[(ball_col, ball_row)].set_char('█');
 
     if let GamePhase::GameOver { winner } = snapshot.phase {
         draw_game_over(frame, court, winner);
@@ -150,7 +146,9 @@ pub fn draw(frame: &mut Frame<'_>, snapshot: &GameSnapshot, score_flash: bool, a
         "left: w/s  ·  right: ↑/↓  ·  restart: r  ·  menu: m  ·  quit: q"
     };
     frame.render_widget(
-        Paragraph::new(footer).alignment(Alignment::Center).dim(),
+        Paragraph::new(footer)
+            .alignment(Alignment::Center)
+            .style(Style::new().dim()),
         footer_area,
     );
 }
@@ -184,10 +182,9 @@ fn draw_paddle(frame: &mut Frame<'_>, geometry: &CourtGeometry, side: Side, y_ce
     let bottom = (center_row + half_height).min(court.y + court.height);
 
     let buf = frame.buffer_mut();
-    let style = Style::new().fg(Color::Cyan);
     for row in top..bottom {
         for col in left..right {
-            buf[(col, row)].set_char('█').set_style(style);
+            buf[(col, row)].set_char('█');
         }
     }
 }
@@ -206,11 +203,7 @@ fn draw_game_over(frame: &mut Frame<'_>, court: Rect, winner: Side) {
             Line::from("r: restart   m: menu   q: quit"),
         ])
         .alignment(Alignment::Center)
-        .block(
-            Block::bordered()
-                .border_set(border::PLAIN)
-                .border_style(Style::new().yellow()),
-        ),
+        .block(Block::bordered().border_set(border::PLAIN)),
         overlay,
     );
 }
