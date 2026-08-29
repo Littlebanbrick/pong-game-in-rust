@@ -18,10 +18,33 @@
 画面 ← pong-tui 渲染   <--GameSnapshot-- （60 TPS 物理推进）
 ```
 
-- **命令通道**（前端 → 后端）：`InputEvent`（按键、重开、退出）。
+- **命令通道**（前端 → 后端）：`InputEvent`（按键、重开、退出、`StartMatch(GameOptions)`）。
 - **状态通道**（后端 → 前端）：`GameSnapshot`，每 tick 一份的完整球场状态；内含 `events: Vec<GameEvent>`——该 tick 内发生的离散事件（击拍、得分、终局），供前端做提示音等表现层反馈。事件随快照传递且被 `latest_snapshot` 合并去弃，故前端漏帧不漏事件。
 - 消息类型定义在 `pong-core`（后端定义协议，前端只消费），第一阶段落地。
 - 前端拿不到后端内部可变状态——边界是物理的，不是靠自觉。
+
+## 对局配置（第三阶段起）
+
+- `GameOptions { opponent, ball_speed }` 随 `InputEvent::StartMatch` 从前端下发：`opponent ∈ {TwoPlayer, Ai(Difficulty)}`、`ball_speed ∈ {Slow, Fast, Mutable}`。
+- 后端启动即处于 `Waiting` 阶段（球停在中心、无倒计时），收到 `StartMatch` 才按配置开局；对局中再次收到 `StartMatch` 按新配置重开。`Restart`（R）沿用当前配置。
+- 球速模式：`Slow` 恒 60、`Fast` 恒 80、`Mutable` 每回合从 60 起步、每次拍击 ×1.1 不设上限、新回合重置；墙壁反弹一律不变速。发球角度表不变。
+
+## AI 对手（第三阶段起）
+
+AI 是游戏逻辑，住在 `pong-core`（`ai.rs`），无任何 I/O：人机模式下每 tick 为右板产出决策（方向 + 视同确认按住），喂给与人类完全相同的拍速模型（含斜坡、死区刹停）。难度四维：
+
+| 维度 | 简单 | 普通 | 困难 |
+|---|---|---|---|
+| 反应延迟 | 12 ticks（200ms） | 6 ticks（100ms） | 2 ticks（约 33ms） |
+| 目标噪声 | σ=6 | σ=3 | 0 |
+| 预判 | 只跟当前球高 | 线性落点（不折算弹墙） | 完整弹道（顶底墙反射折算） |
+| 拍速上限 | 48（60%） | 80 | 80 |
+
+噪声在球每次转向己方时重新抽取、一拍一抽；目标点落在拍心 ±1 单位死区内不动作。AI 不经输入通道——它直接驱动内部状态，输入通道仍专属人类。
+
+## 开始菜单（第三阶段起，纯前端）
+
+菜单是表现层：`pong-tui/src/menu.rs` 持有选择状态（Opponent × Ball speed 两行，值右对齐），画面为 Angband 式巨幅 PONG 方块标题 + 选项盒，开局时打包成 `StartMatch(GameOptions)` 发给后端；`Waiting` 阶段前端渲染菜单而非球场。人机模式下前端把 ↑/↓ 重映射到左板（单人右手友好），双人模式维持左右分治。终局：R 同配置重开（`Restart`）、M 回菜单（前端切回菜单渲染，等 `StartMatch`）、q 退出。界面文案全英文：Opponent（2 players / AI·easy / AI·normal / AI·hard）、Ball speed（slow / fast / accelerating）。
 
 ## 音效（第二阶段起）
 
@@ -44,9 +67,9 @@
 - 同侧两键同按，后按者生效；一键过期后回退到仍按住的键（连同其确认状态）；若终端报告真实松开事件（如 kitty 协议）则立即生效，无需等待超时。
 - 已知代价：系统关闭按键重复时，"按住"永远无法确认，退化为 1/3 速度定长点动。
 
-## 状态机（第二阶段范围）
+## 状态机（第三阶段范围）
 
-`Serving { toward, ticks_left } → Playing →（失分）→ Serving → … → GameOver { winner } →（R 重开）→ Serving`；q 随时退出。
+`Waiting →（StartMatch）→ Serving { toward, ticks_left } → Playing →（失分）→ Serving → … → GameOver { winner } →（R 重开 / M 回菜单）→ Serving / Waiting`；q 随时退出。
 
 - 发球规则：失分后停顿 1 秒，球飞向刚丢分的一方；开局随机方向。发球角度从 {0°, ±15°, ±30°, ±45°} 查表随机，平射双倍权重（沿用 FPGA 版 Pong-dld 的表形），均不超 45°。
-- 物理约束：反弹只改方向；球的合速度大小恒为 `BALL_SPEED`，反弹角随击球位置变化（拍沿最陡 60°，拍心平回）。
+- 物理约束：反弹只改方向；球的合速度大小由球速模式决定（恒定或逐拍 ×1.1，见"对局配置"），反弹角随击球位置变化（拍沿最陡 60°，拍心平回）。
