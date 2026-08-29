@@ -71,7 +71,9 @@ impl CourtGeometry {
 ///
 /// `score_flash` styles the score line while the score-flash effect is on
 /// (the frontend blinks it for a short moment after a point).
-pub fn draw(frame: &mut Frame<'_>, snapshot: &GameSnapshot, score_flash: bool) {
+/// `ai_opponent` switches the footer hints: in AI matches the arrow keys
+/// belong to the left paddle.
+pub fn draw(frame: &mut Frame<'_>, snapshot: &GameSnapshot, score_flash: bool, ai_opponent: bool) {
     // A zero-sized terminal (a headless pty, a pipe) cannot hold a
     // court; drawing into one would index outside the buffer.
     if frame.area().width == 0 || frame.area().height == 0 {
@@ -142,10 +144,13 @@ pub fn draw(frame: &mut Frame<'_>, snapshot: &GameSnapshot, score_flash: bool) {
         draw_game_over(frame, court, winner);
     }
 
+    let footer = if ai_opponent {
+        "left: w/s ↑/↓  ·  restart: r  ·  menu: m  ·  quit: q"
+    } else {
+        "left: w/s  ·  right: ↑/↓  ·  restart: r  ·  menu: m  ·  quit: q"
+    };
     frame.render_widget(
-        Paragraph::new("left: w/s  ·  right: ↑/↓  ·  restart: r  ·  quit: q")
-            .alignment(Alignment::Center)
-            .dim(),
+        Paragraph::new(footer).alignment(Alignment::Center).dim(),
         footer_area,
     );
 }
@@ -198,7 +203,7 @@ fn draw_game_over(frame: &mut Frame<'_>, court: Rect, winner: Side) {
         Paragraph::new(vec![
             Line::from("GAME OVER"),
             Line::from(format!("{who} wins")),
-            Line::from("r: restart   q: quit"),
+            Line::from("r: restart   m: menu   q: quit"),
         ])
         .alignment(Alignment::Center)
         .block(

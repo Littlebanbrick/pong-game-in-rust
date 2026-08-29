@@ -27,7 +27,7 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use pong_core::{Direction, InputEvent, Side};
+use pong_core::{Direction, InputEvent, Opponent, Side};
 
 /// Upper bound (and pre-measurement fallback) of the adaptive window
 /// after which a repeating key that went silent is considered released.
@@ -52,6 +52,9 @@ pub const HOLD_START_TIMEOUT: Duration = Duration::from_millis(600);
 pub enum Action {
     /// Forward this event to the backend.
     Send(InputEvent),
+    /// Return to the start menu. Meaningful only at a game over — the
+    /// main loop checks the snapshot phase before honoring it.
+    Menu,
     /// Stop the frontend loop (the backend shuts down via `Drop`).
     Quit,
 }
@@ -170,11 +173,24 @@ impl SideState {
 pub struct InputState {
     left: SideState,
     right: SideState,
+    /// AI matches: the arrow keys steer the left paddle (the right one
+    /// belongs to the backend).
+    arrows_are_left: bool,
 }
 
 impl InputState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reconfigures the model for a fresh match: drops all held-key
+    /// bookkeeping and remaps the arrow keys per the opponent. The
+    /// backend clears its own paddle state on `StartMatch`, so no stop
+    /// events need to be sent here.
+    pub fn start_match(&mut self, opponent: Opponent) {
+        self.left = SideState::default();
+        self.right = SideState::default();
+        self.arrows_are_left = matches!(opponent, Opponent::Ai(_));
     }
 
     fn side_mut(&mut self, side: Side) -> &mut SideState {
@@ -197,9 +213,14 @@ impl InputState {
             };
         }
 
+        let arrow_side = if self.arrows_are_left {
+            Side::Left
+        } else {
+            Side::Right
+        };
         let movement = match key.code {
-            KeyCode::Up => Some((Side::Right, Direction::Up)),
-            KeyCode::Down => Some((Side::Right, Direction::Down)),
+            KeyCode::Up => Some((arrow_side, Direction::Up)),
+            KeyCode::Down => Some((arrow_side, Direction::Down)),
             KeyCode::Char(c) => match c.to_ascii_lowercase() {
                 'w' => Some((Side::Left, Direction::Up)),
                 's' => Some((Side::Left, Direction::Down)),
@@ -214,6 +235,7 @@ impl InputState {
             }
             return match key.code {
                 KeyCode::Char('r') => Some(Action::Send(InputEvent::Restart)),
+                KeyCode::Char('m') => Some(Action::Menu),
                 KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
                 _ => None,
             };
@@ -296,6 +318,7 @@ impl InputState {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use pong_core::Difficulty;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -675,5 +698,67 @@ mod tests {
         assert_eq!(state.handle_key(key(KeyCode::Char('x')), at(base, 0)), None);
         assert_eq!(state.handle_key(key(KeyCode::F(5)), at(base, 0)), None);
         assert_eq!(state.handle_key(key(KeyCode::Enter), at(base, 0)), None);
+    }
+
+    #[test]
+    fn m_opens_the_menu_on_press_only() {
+        let base = Instant::now();
+        let mut state = InputState::new();
+        assert_eq!(
+            state.handle_key(key(KeyCode::Char('m')), at(base, 0)),
+            Some(Action::Menu)
+        );
+        assert_eq!(
+            state.handle_key(release(KeyCode::Char('m')), at(base, 0)),
+            None
+        );
+    }
+
+    /// AI matches remap the arrow keys to the left paddle: the right
+    /// one belongs to the backend.
+    #[test]
+    fn arrow_keys_steer_the_left_paddle_in_ai_matches() {
+        let base = Instant::now();
+        let mut state = InputState::new();
+        state.start_match(Opponent::Ai(Difficulty::Easy));
+        assert_eq!(
+            state.handle_key(key(KeyCode::Up), at(base, 0)),
+            Some(send(Side::Left, Some(Direction::Up), false))
+        );
+        assert_eq!(
+            state.handle_key(key(KeyCode::Down), at(base, 10)),
+            Some(send(Side::Left, Some(Direction::Down), false))
+        );
+    }
+
+    /// Two-player matches keep the phase-2 mapping: arrows are the
+    /// right paddle's.
+    #[test]
+    fn arrow_keys_stay_on_the_right_paddle_in_two_player_matches() {
+        let base = Instant::now();
+        let mut state = InputState::new();
+        state.start_match(Opponent::TwoPlayer);
+        assert_eq!(
+            state.handle_key(key(KeyCode::Up), at(base, 0)),
+            Some(send(Side::Right, Some(Direction::Up), false))
+        );
+    }
+
+    /// Starting a match drops stale held-key bookkeeping, but the
+    /// backend is told nothing: its own `StartMatch` resets paddles.
+    #[test]
+    fn start_match_clears_held_keys_silently() {
+        let base = Instant::now();
+        let mut state = InputState::new();
+        state.handle_key(key(KeyCode::Char('w')), at(base, 0));
+        state.handle_key(key(KeyCode::Up), at(base, 0));
+        state.start_match(Opponent::Ai(Difficulty::Hard));
+        // Nothing held anymore: a long silence sweeps nothing.
+        assert!(state.sweep(at(base, 10_000)).is_empty());
+        // A fresh press works normally (and lands on the left side).
+        assert_eq!(
+            state.handle_key(key(KeyCode::Up), at(base, 10_050)),
+            Some(send(Side::Left, Some(Direction::Up), false))
+        );
     }
 }
