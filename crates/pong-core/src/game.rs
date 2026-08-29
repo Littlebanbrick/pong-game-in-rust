@@ -14,9 +14,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::ai::AiController;
 use crate::protocol::{
     BallSpeedMode, Direction, FIELD_HEIGHT, FIELD_WIDTH, GameEvent, GameOptions, GamePhase,
-    GameSnapshot, InputEvent, Score, Side,
+    GameSnapshot, InputEvent, Opponent, Score, Side,
 };
 
 /// Simulation rate of the backend, in ticks per second.
@@ -142,6 +143,12 @@ pub struct Game {
     pending_events: Vec<GameEvent>,
     /// Configuration of the current (or upcoming) match.
     options: GameOptions,
+    /// The AI driving the right paddle, when the opponent is one.
+    ai: Option<AiController>,
+    /// Per-side paddle speed ceiling (the easy AI is capped below
+    /// `PADDLE_SPEED`).
+    left_max_speed: f32,
+    right_max_speed: f32,
     /// Current ball speed magnitude in units per second — constant in the
     /// Slow/Fast modes, grown by every paddle hit in the Mutable mode.
     ball_speed: f32,
@@ -190,6 +197,9 @@ impl Game {
             rng: Xorshift::new(seed),
             pending_events: Vec::new(),
             options: GameOptions::default(),
+            ai: None,
+            left_max_speed: PADDLE_SPEED,
+            right_max_speed: PADDLE_SPEED,
             ball_speed: BALL_SPEED,
         }
     }
@@ -197,6 +207,12 @@ impl Game {
     /// Starts a fresh match with `options`, discarding any current one.
     pub fn begin_match(&mut self, options: GameOptions) {
         self.options = options;
+        self.ai = match options.opponent {
+            Opponent::Ai(difficulty) => Some(AiController::new(difficulty)),
+            Opponent::TwoPlayer => None,
+        };
+        self.right_max_speed = self.ai.as_ref().map_or(PADDLE_SPEED, |ai| ai.max_speed());
+        self.left_max_speed = PADDLE_SPEED;
         self.reset();
     }
 
@@ -207,16 +223,24 @@ impl Game {
                 side,
                 direction,
                 held,
-            } => match side {
-                Side::Left => {
-                    self.left_direction = direction;
-                    self.left_held = held;
+            } => {
+                // In AI matches the right paddle is the AI's; human input
+                // for it is ignored (the frontend remaps ↑/↓ to the left
+                // paddle, so this only guards against stray events).
+                if matches!(side, Side::Right) && self.ai.is_some() {
+                    return;
                 }
-                Side::Right => {
-                    self.right_direction = direction;
-                    self.right_held = held;
+                match side {
+                    Side::Left => {
+                        self.left_direction = direction;
+                        self.left_held = held;
+                    }
+                    Side::Right => {
+                        self.right_direction = direction;
+                        self.right_held = held;
+                    }
                 }
-            },
+            }
             InputEvent::StartMatch(options) => self.begin_match(options),
             InputEvent::Restart => {
                 if matches!(self.phase, GamePhase::GameOver { .. }) {
@@ -242,6 +266,7 @@ impl Game {
                 self.move_paddle(Side::Right);
             }
             GamePhase::Serving { toward, ticks_left } => {
+                self.run_ai();
                 self.move_paddle(Side::Left);
                 self.move_paddle(Side::Right);
                 if ticks_left <= 1 {
@@ -254,6 +279,7 @@ impl Game {
                 }
             }
             GamePhase::Playing => {
+                self.run_ai();
                 self.move_paddle(Side::Left);
                 self.move_paddle(Side::Right);
                 self.ball.x += self.ball.vx;
@@ -265,6 +291,21 @@ impl Game {
             }
             GamePhase::GameOver { .. } => {}
         }
+    }
+
+    /// Lets the AI (if any) steer the right paddle for this tick. Its
+    /// decision goes through the same fields a human's input would set,
+    /// so it inherits the full paddle speed model.
+    fn run_ai(&mut self) {
+        let Some(ai) = self.ai.as_mut() else { return };
+        let direction = ai.decide(
+            (self.ball.x, self.ball.y, self.ball.vx, self.ball.vy),
+            self.right_paddle_y,
+            &mut self.rng,
+        );
+        self.right_direction = direction;
+        // The AI "holds" its key for as long as it keeps steering.
+        self.right_held = direction.is_some();
     }
 
     /// Returns a complete renderable copy of the current state, consuming
@@ -349,14 +390,18 @@ impl Game {
             ),
         };
         // Speed model: an unconfirmed tap moves at a constant crawl; a
-        // confirmed hold ramps linearly up to the full speed; releasing
-        // stops instantly. Pressing from standstill starts at the crawl
-        // speed — first-tick responsiveness is the whole point of the
-        // tap tier, so only the tap→full transition is smoothed.
+        // confirmed hold ramps linearly up to the side's speed ceiling;
+        // releasing stops instantly. Pressing from standstill starts at
+        // the crawl speed — first-tick responsiveness is the whole point
+        // of the tap tier, so only the tap→full transition is smoothed.
+        let max_speed = match side {
+            Side::Left => self.left_max_speed,
+            Side::Right => self.right_max_speed,
+        };
         *speed = match direction {
             None => 0.0,
             Some(_) if !held => PADDLE_TAP_SPEED,
-            Some(_) => (*speed + PADDLE_ACCEL * DT).clamp(PADDLE_TAP_SPEED, PADDLE_SPEED),
+            Some(_) => (*speed + PADDLE_ACCEL * DT).clamp(PADDLE_TAP_SPEED, max_speed),
         };
         let Some(direction) = direction else { return };
         let step = match direction {
@@ -486,7 +531,7 @@ impl Xorshift {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Opponent;
+    use crate::protocol::Difficulty;
 
     const CENTER_Y: f32 = FIELD_HEIGHT / 2.0;
     const LEFT_PADDLE_X: f32 = PADDLE_INSET;
@@ -1196,6 +1241,39 @@ mod tests {
             (game.ball.speed() - SLOW_STEP).abs() < 1e-6,
             "wall bounces keep the speed"
         );
+    }
+
+    #[test]
+    fn ai_match_moves_the_right_paddle_on_its_own() {
+        let mut game = Game::initial(42);
+        game.begin_match(options(Opponent::Ai(Difficulty::Hard), BallSpeedMode::Fast));
+        play_after_serve(&mut game);
+        // Park a high ball flying straight at the AI.
+        game.ball = Ball {
+            x: FIELD_WIDTH / 2.0,
+            y: 10.0,
+            vx: BALL_STEP,
+            vy: 0.0,
+        };
+        let before = game.right_paddle_y;
+        for _ in 0..30 {
+            game.tick();
+        }
+        assert!(
+            game.right_paddle_y < before,
+            "the hard AI should chase the ball upward, {} -> {}",
+            before,
+            game.right_paddle_y
+        );
+    }
+
+    #[test]
+    fn easy_ai_paddle_is_capped_below_full_speed() {
+        let mut game = Game::initial(42);
+        game.begin_match(options(Opponent::Ai(Difficulty::Easy), BallSpeedMode::Fast));
+        // The easy AI's speed ceiling (see ai.rs::EASY_MAX_SPEED).
+        assert_eq!(game.right_max_speed, 48.0);
+        assert_eq!(game.left_max_speed, PADDLE_SPEED);
     }
 
     #[test]
