@@ -1,0 +1,58 @@
+name: Release
+
+# Builds and attaches release binaries whenever a version tag is
+# pushed. The workflow_dispatch entry lets us rebuild the assets of an
+# already-released tag (e.g. backfilling a platform we added later)
+# without moving any git refs.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to rebuild assets for (e.g. v0.3.0)'
+        required: true
+
+# Uploading release assets needs write access to the repository.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            binary: pong
+            asset: linux-x86_64
+          - os: windows-latest
+            binary: pong.exe
+            asset: windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # On a tag push this is the tag itself; when dispatched it is
+          # the tag named in the input.
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: dtolnay/rust-toolchain@stable
+      # rodio (via cpal/alsa-sys) needs the ALSA dev headers at build
+      # time on Linux; on Windows it uses WASAPI and needs nothing.
+      - name: Install audio dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Build
+        run: cargo build --release
+      - name: Strip (Linux)
+        if: runner.os == 'Linux'
+        run: strip target/release/pong
+      # bash is available on both runners; use it everywhere so the
+      # asset naming is identical across platforms.
+      - name: Collect asset
+        shell: bash
+        run: cp "target/release/${{ matrix.binary }}" "pong-${{ inputs.tag || github.ref_name }}-${{ matrix.asset }}"
+      - name: Upload to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.tag || github.ref_name }}" "pong-${{ inputs.tag || github.ref_name }}-${{ matrix.asset }}" --clobber
